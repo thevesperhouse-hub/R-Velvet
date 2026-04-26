@@ -177,7 +177,7 @@ class Trainer:
         csv_writer = csv.writer(csv_file)
         csv_headers = ['step', 'loss', 'ce', 'ppl', 'lr', 'elapsed']
         if self.use_velvet:
-            csv_headers += ['beta1', 'lvs_scale', 'r2', 'pgm_scale', 'grad_norm', 'lvs_phase']
+            csv_headers += ['beta1', 'lvs_scale', 'signal', 'pgm_scale', 'grad_norm', 'lvs_phase']
         csv_writer.writerow(csv_headers)
 
         loader = DataLoader(
@@ -310,7 +310,7 @@ class Trainer:
                 if self.use_velvet:
                     log_parts.append(f"b1={self.optimizer.effective_beta1:.3f}")
                     log_parts.append(f"lvs={self.optimizer.lr_scale:.3f}")
-                    log_parts.append(f"R2={self.optimizer.lvs_confidence:.2f}")
+                    log_parts.append(f"sig={self.optimizer.lvs_confidence:.2f}")
 
                 print(" | ".join(log_parts))
 

@@ -101,12 +101,15 @@ def plot_single(data: dict, title: str, output_path: str):
         ax.set_title('LVS: LR Scale Factor')
         ax.grid(True, alpha=0.3)
 
-        # R² (confidence)
+        # Signal strength
         ax = axes[3, 0]
-        ax.plot(steps, data['r2'], 'c-', linewidth=0.8)
+        if 'signal' in data:
+            ax.plot(steps, data['signal'], 'c-', linewidth=0.8)
+        elif 'r2' in data:
+            ax.plot(steps, data['r2'], 'c-', linewidth=0.8)
         ax.set_xlabel('Step')
-        ax.set_ylabel('R²')
-        ax.set_title('LVS: Trend Confidence (R²)')
+        ax.set_ylabel('Signal')
+        ax.set_title('LVS: Signal Strength (EMA gap)')
         ax.grid(True, alpha=0.3)
 
         # LVS phase

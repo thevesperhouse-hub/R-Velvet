@@ -1,15 +1,17 @@
-"""Velvet Optimizer — AdamW + PGM + LVS v2.
+"""Velvet Optimizer — AdamW + PGM + LVS v4.
 
 Combines two adaptive mechanisms on top of AdamW:
 
   PGM (Perplexity-Guided Momentum):
-    - Adapts beta1 based on perplexity: high ppl → more momentum, low ppl → less
-    - Fast convergence: pushes through plateaus when model is struggling
-    - Formula: eff_beta1 = clamp(beta1 * (40 / ppl), 0.5, 0.999)
+    - Adapts beta1 based on normalized loss ratio (U-curve)
+    - Active learning zone: less momentum (faster reaction)
+    - Converging zone: more momentum (stability)
 
-  LVS v2 (Loss-Velocity Scaling):
-    - Window-based trend detection (linear regression over 64 losses + R²)
-    - Adapts LR: stalled → boost, diverging → dampen, noisy → stay neutral
+  LVS v4 (Loss-Velocity Scaling):
+    - Dual-EMA crossover: fast EMA (~20 steps) vs slow EMA (~100 steps)
+    - Fast < slow = improving → boost LR
+    - Fast > slow = worsening → dampen LR
+    - Works at ALL loss scales (no R² gate that dies in late training)
     - Phase-adaptive range: early [0.7, 1.3], late [0.9, 1.1]
 
 Three backends (auto-detected, priority order):
@@ -63,19 +65,15 @@ class VelvetOptimizer(Optimizer):
         )
         super().__init__(params, defaults)
 
-        # LVS v2 state: multi-scale trend detection (for LR)
-        self._loss_window = []
-        self._lvs_window_size = 64
-        self._lvs_short_window = 20  # fallback when long window R² is low
-        self._lvs_min_window = 12
+        # LVS v4 state: dual-EMA crossover (replaces R²-gated approach)
+        self._ema_fast = None   # ~20 step effective window
+        self._ema_slow = None   # ~100 step effective window
+        self._ema_fast_alpha = 2.0 / (20 + 1)   # ≈ 0.095
+        self._ema_slow_alpha = 2.0 / (100 + 1)  # ≈ 0.0198
         self._lvs_phase_steps = 20000  # overridden by set_training_steps()
-        self._lvs_confidence = 0.0
+        self._lvs_confidence = 0.0  # kept for logging (how strong is the signal)
         self._entropy_scale = 1.0
-        # Stall detection: EMA baseline for plateau damping
-        self._loss_ema = None
-        self._loss_ema_alpha = 0.02  # slow-moving baseline
-        # LVS momentum: smooth scale transitions
-        self._lvs_momentum = 0.85
+        self._lvs_momentum = 0.85  # smooth scale transitions
         # PGM state: perplexity-guided momentum (for beta1)
         self._perplexity_scale = 1.0
         self._last_grad_norm = 0.0
@@ -94,40 +92,14 @@ class VelvetOptimizer(Optimizer):
         """Set total training steps so LVS phase tracks actual run length."""
         self._lvs_phase_steps = max(max_steps, 1)
 
-    @staticmethod
-    def _ols_trend(window):
-        """Linear regression over a loss window. Returns (slope, r_squared, mean)."""
-        n = len(window)
-        sum_t = n * (n - 1) / 2.0
-        sum_t2 = n * (n - 1) * (2 * n - 1) / 6.0
-        sum_y = 0.0
-        sum_ty = 0.0
-        for i, y in enumerate(window):
-            sum_y += y
-            sum_ty += i * y
-
-        denom = n * sum_t2 - sum_t * sum_t
-        if denom < 1e-12:
-            return 0.0, 0.0, sum_y / max(n, 1)
-
-        slope = (n * sum_ty - sum_t * sum_y) / denom
-        intercept = (sum_y - slope * sum_t) / n
-        mean_y = sum_y / n
-
-        ss_tot = 0.0
-        ss_res = 0.0
-        for i, y in enumerate(window):
-            ss_tot += (y - mean_y) ** 2
-            ss_res += (y - (intercept + slope * i)) ** 2
-
-        r2 = max(0.0, min(1.0, 1.0 - ss_res / ss_tot)) if ss_tot > 1e-12 else 0.0
-        return slope, r2, mean_y
-
     def set_loss_metrics(self, loss_val: float, vocab_size: int):
         """Update both LVS (LR scaling) and PGM (momentum scaling).
 
-        LVS: Multi-scale trend detection — tries long window (64), falls back
-        to short window (20) when R² is low. Prevents losing signal in noise.
+        LVS v4: Dual-EMA crossover — fast EMA vs slow EMA.
+        When fast < slow, the loss is trending down → boost.
+        When fast > slow, the loss is trending up → dampen.
+        Works at all loss scales, no R² gate.
+
         PGM: Perplexity-guided momentum — U-curve based on loss ratio.
         """
         if not math.isfinite(loss_val):
@@ -145,60 +117,56 @@ class VelvetOptimizer(Optimizer):
             pgm_scale = 0.8 + 2.0 * (0.2 - ratio)
         self._perplexity_scale = max(0.7, min(1.3, pgm_scale))
 
-        # ---- LVS v3: Multi-scale trend detection ----
-        self._loss_window.append(loss_val)
-        if len(self._loss_window) > self._lvs_window_size:
-            self._loss_window.pop(0)
-
-        n = len(self._loss_window)
-        if n < self._lvs_min_window:
+        # ---- LVS v4: Dual-EMA crossover ----
+        # Initialize EMAs on first call
+        if self._ema_fast is None:
+            self._ema_fast = loss_val
+            self._ema_slow = loss_val
             self._entropy_scale = 1.0
             self._lvs_confidence = 0.0
             return
 
-        # Primary: full window regression
-        slope, r_squared, mean_y = self._ols_trend(self._loss_window)
+        # Update EMAs
+        self._ema_fast += self._ema_fast_alpha * (loss_val - self._ema_fast)
+        self._ema_slow += self._ema_slow_alpha * (loss_val - self._ema_slow)
 
-        # Fallback: if R² is low on full window, try short window
-        # Short window captures recent trends that get diluted in the long window
-        if r_squared < 0.3 and n > self._lvs_short_window:
-            short_slice = self._loss_window[-self._lvs_short_window:]
-            short_slope, short_r2, short_mean = self._ols_trend(short_slice)
-            if short_r2 > r_squared:
-                slope, r_squared, mean_y = short_slope, short_r2, short_mean
+        # Crossover signal: normalized gap between fast and slow
+        # Negative = fast < slow = improving, Positive = fast > slow = worsening
+        mean_ema = (self._ema_fast + self._ema_slow) / 2.0
+        if mean_ema < 1e-8:
+            self._entropy_scale = 1.0
+            self._lvs_confidence = 0.0
+            return
 
-        self._lvs_confidence = r_squared
+        gap = (self._ema_fast - self._ema_slow) / mean_ema
+        # Clamp to [-1, 1]
+        gap = max(-1.0, min(1.0, gap))
+
+        # Confidence: how far apart the EMAs are (absolute gap)
+        # Large gap = strong signal, small gap = uncertain
+        self._lvs_confidence = min(1.0, abs(gap) * 20.0)  # 5% gap → confidence 1.0
 
         # Phase-adaptive range: early=wide [0.7, 1.3], late=narrow [0.9, 1.1]
         phase = min(1.0, self._global_step / max(self._lvs_phase_steps, 1))
         max_boost = 1.3 - 0.2 * phase
         max_damp = 0.7 + 0.2 * phase
 
-        # Normalize slope relative to mean loss magnitude
-        baseline = abs(mean_y) * 0.01 + 1e-8
-        norm_slope = max(-1.0, min(1.0, slope / baseline))
-
-        # Map slope to raw scale
-        if norm_slope <= 0:
-            raw_scale = 1.0 + (max_boost - 1.0) * (1.0 + norm_slope)
+        # Map gap to raw scale:
+        #   gap < 0 (improving)  → boost: scale between 1.0 and max_boost
+        #   gap > 0 (worsening)  → dampen: scale between max_damp and 1.0
+        #   gap = 0 (flat)       → neutral: 1.0
+        if gap <= 0:
+            # Improving: stronger improvement → more boost
+            raw_scale = 1.0 + (max_boost - 1.0) * min(1.0, abs(gap) * 10.0)
         else:
-            raw_scale = max_boost - (max_boost - max_damp) * norm_slope
+            # Worsening: stronger worsening → more damping
+            raw_scale = 1.0 - (1.0 - max_damp) * min(1.0, gap * 10.0)
 
-        # Blend with confidence + momentum for smooth transitions
-        new_scale = 1.0 + r_squared * (raw_scale - 1.0)
-        self._entropy_scale = self._lvs_momentum * self._entropy_scale + (1.0 - self._lvs_momentum) * new_scale
+        # Momentum: smooth transitions
+        self._entropy_scale = self._lvs_momentum * self._entropy_scale + (1.0 - self._lvs_momentum) * raw_scale
 
-        # ---- Stall damping: when loss stops improving, dampen to settle ----
-        if self._loss_ema is None:
-            self._loss_ema = mean_y
-        else:
-            self._loss_ema += self._loss_ema_alpha * (mean_y - self._loss_ema)
-
-        if self._loss_ema > 1e-8:
-            stall_gap = (mean_y - self._loss_ema) / self._loss_ema
-            if stall_gap > 0.005:
-                damp = max(max_damp, 1.0 - min(stall_gap * 2, 0.15))
-                self._entropy_scale = min(self._entropy_scale, damp)
+        # Clamp to phase range
+        self._entropy_scale = max(max_damp, min(max_boost, self._entropy_scale))
 
     @property
     def effective_lr(self) -> float:
@@ -227,7 +195,7 @@ class VelvetOptimizer(Optimizer):
 
     @property
     def lvs_confidence(self) -> float:
-        """R-squared of the loss trend regression (0=noise, 1=strong trend)."""
+        """Signal strength of the EMA crossover (0=flat, 1=strong trend)."""
         return self._lvs_confidence
 
     @property
