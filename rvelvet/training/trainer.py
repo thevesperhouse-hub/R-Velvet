@@ -175,7 +175,7 @@ class Trainer:
         csv_path = self.output_dir / "metrics.csv"
         csv_file = open(csv_path, 'w', newline='')
         csv_writer = csv.writer(csv_file)
-        csv_headers = ['step', 'loss', 'ce', 'lr', 'elapsed']
+        csv_headers = ['step', 'loss', 'ce', 'ppl', 'lr', 'elapsed']
         if self.use_velvet:
             csv_headers += ['beta1', 'lvs_scale', 'r2', 'pgm_scale', 'grad_norm', 'lvs_phase']
         csv_writer.writerow(csv_headers)
@@ -288,10 +288,14 @@ class Trainer:
                 else:
                     lr_now = self.optimizer.param_groups[0]['lr']
 
+                ce_val = avg_dict.get('ce', 0)
+                ppl_val = math.exp(min(ce_val, 20))  # cap to avoid overflow
+
                 log_parts = [
                     f"step {self.global_step}/{max_steps}",
                     f"loss={avg_loss:.4f}",
-                    f"ce={avg_dict.get('ce', 0):.4f}",
+                    f"ce={ce_val:.4f}",
+                    f"ppl={ppl_val:.1f}",
                     f"lr={lr_now:.2e}",
                     f"{dt:.1f}s",
                 ]
@@ -311,8 +315,8 @@ class Trainer:
                 print(" | ".join(log_parts))
 
                 # CSV log
-                csv_row = [self.global_step, f"{avg_loss:.6f}", f"{avg_dict.get('ce', 0):.6f}",
-                           f"{lr_now:.6e}", f"{dt:.2f}"]
+                csv_row = [self.global_step, f"{avg_loss:.6f}", f"{ce_val:.6f}",
+                           f"{ppl_val:.2f}", f"{lr_now:.6e}", f"{dt:.2f}"]
                 if self.use_velvet:
                     csv_row += [
                         f"{self.optimizer.effective_beta1:.4f}",

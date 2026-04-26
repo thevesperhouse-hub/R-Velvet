@@ -42,10 +42,9 @@ def plot_single(data: dict, title: str, output_path: str):
     has_velvet = 'beta1' in data
 
     if has_velvet:
-        fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+        fig, axes = plt.subplots(4, 2, figsize=(14, 16))
     else:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        axes = axes.reshape(1, 2)
+        fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 
     steps = data['step']
 
@@ -57,17 +56,36 @@ def plot_single(data: dict, title: str, output_path: str):
     ax.set_title('Training Loss')
     ax.grid(True, alpha=0.3)
 
-    # LR
+    # Perplexity
     ax = axes[0, 1]
+    if 'ppl' in data:
+        ax.plot(steps, data['ppl'], 'b-', linewidth=0.8)
+        ax.set_yscale('log')
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Perplexity')
+    ax.set_title('Perplexity (log scale)')
+    ax.grid(True, alpha=0.3)
+
+    # LR
+    ax = axes[1, 0]
     ax.plot(steps, data['lr'], 'r-', linewidth=0.8)
     ax.set_xlabel('Step')
     ax.set_ylabel('Learning Rate')
     ax.set_title('Effective LR')
     ax.grid(True, alpha=0.3)
 
+    # Grad norm (or empty for AdamW)
+    ax = axes[1, 1]
+    if has_velvet and 'grad_norm' in data:
+        ax.plot(steps, data['grad_norm'], 'orange', linewidth=0.8)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Grad Norm')
+    ax.set_title('Gradient Norm')
+    ax.grid(True, alpha=0.3)
+
     if has_velvet:
         # Beta1 (PGM)
-        ax = axes[1, 0]
+        ax = axes[2, 0]
         ax.plot(steps, data['beta1'], 'g-', linewidth=0.8)
         ax.set_xlabel('Step')
         ax.set_ylabel('Beta1')
@@ -75,7 +93,7 @@ def plot_single(data: dict, title: str, output_path: str):
         ax.grid(True, alpha=0.3)
 
         # LVS scale
-        ax = axes[1, 1]
+        ax = axes[2, 1]
         ax.plot(steps, data['lvs_scale'], 'm-', linewidth=0.8)
         ax.axhline(y=1.0, color='k', linestyle='--', alpha=0.3)
         ax.set_xlabel('Step')
@@ -84,19 +102,20 @@ def plot_single(data: dict, title: str, output_path: str):
         ax.grid(True, alpha=0.3)
 
         # R² (confidence)
-        ax = axes[2, 0]
+        ax = axes[3, 0]
         ax.plot(steps, data['r2'], 'c-', linewidth=0.8)
         ax.set_xlabel('Step')
         ax.set_ylabel('R²')
         ax.set_title('LVS: Trend Confidence (R²)')
         ax.grid(True, alpha=0.3)
 
-        # Grad norm
-        ax = axes[2, 1]
-        ax.plot(steps, data['grad_norm'], 'orange', linewidth=0.8)
+        # LVS phase
+        ax = axes[3, 1]
+        if 'lvs_phase' in data:
+            ax.plot(steps, data['lvs_phase'], 'k-', linewidth=0.8)
         ax.set_xlabel('Step')
-        ax.set_ylabel('Grad Norm')
-        ax.set_title('Gradient Norm')
+        ax.set_ylabel('Phase')
+        ax.set_title('LVS: Training Phase (0=early, 1=late)')
         ax.grid(True, alpha=0.3)
 
     fig.suptitle(title, fontsize=14, fontweight='bold')
