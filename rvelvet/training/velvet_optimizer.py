@@ -63,18 +63,19 @@ class VelvetOptimizer(Optimizer):
         )
         super().__init__(params, defaults)
 
-        # LVS v2 state: window-based trend detection (for LR)
+        # LVS v2 state: multi-scale trend detection (for LR)
         self._loss_window = []
         self._lvs_window_size = 64
-        self._lvs_min_window = 16
+        self._lvs_short_window = 20  # fallback when long window R² is low
+        self._lvs_min_window = 12
         self._lvs_phase_steps = 20000  # overridden by set_training_steps()
         self._lvs_confidence = 0.0
         self._entropy_scale = 1.0
         # Stall detection: EMA baseline for plateau damping
         self._loss_ema = None
         self._loss_ema_alpha = 0.02  # slow-moving baseline
-        # LVS momentum: smooth scale transitions instead of snapping to neutral
-        self._lvs_momentum = 0.9  # decay factor (0.9 = ~50 steps to fully decay)
+        # LVS momentum: smooth scale transitions
+        self._lvs_momentum = 0.85
         # PGM state: perplexity-guided momentum (for beta1)
         self._perplexity_scale = 1.0
         self._last_grad_norm = 0.0
@@ -93,34 +94,58 @@ class VelvetOptimizer(Optimizer):
         """Set total training steps so LVS phase tracks actual run length."""
         self._lvs_phase_steps = max(max_steps, 1)
 
+    @staticmethod
+    def _ols_trend(window):
+        """Linear regression over a loss window. Returns (slope, r_squared, mean)."""
+        n = len(window)
+        sum_t = n * (n - 1) / 2.0
+        sum_t2 = n * (n - 1) * (2 * n - 1) / 6.0
+        sum_y = 0.0
+        sum_ty = 0.0
+        for i, y in enumerate(window):
+            sum_y += y
+            sum_ty += i * y
+
+        denom = n * sum_t2 - sum_t * sum_t
+        if denom < 1e-12:
+            return 0.0, 0.0, sum_y / max(n, 1)
+
+        slope = (n * sum_ty - sum_t * sum_y) / denom
+        intercept = (sum_y - slope * sum_t) / n
+        mean_y = sum_y / n
+
+        ss_tot = 0.0
+        ss_res = 0.0
+        for i, y in enumerate(window):
+            ss_tot += (y - mean_y) ** 2
+            ss_res += (y - (intercept + slope * i)) ** 2
+
+        r2 = max(0.0, min(1.0, 1.0 - ss_res / ss_tot)) if ss_tot > 1e-12 else 0.0
+        return slope, r2, mean_y
+
     def set_loss_metrics(self, loss_val: float, vocab_size: int):
         """Update both LVS (LR scaling) and PGM (momentum scaling).
 
-        LVS: Window-based trend detection via linear regression + R².
-        PGM: Perplexity-guided momentum — high ppl → more momentum.
+        LVS: Multi-scale trend detection — tries long window (64), falls back
+        to short window (20) when R² is low. Prevents losing signal in noise.
+        PGM: Perplexity-guided momentum — U-curve based on loss ratio.
         """
         if not math.isfinite(loss_val):
             return
 
         # ---- PGM v2: Loss-Normalized Momentum ----
-        # Normalize loss relative to max entropy (= ln(vocab_size))
         max_entropy = math.log(max(vocab_size, 2))
-        ratio = min(loss_val, max_entropy) / max_entropy  # 1.0 at random init, → 0
+        ratio = min(loss_val, max_entropy) / max_entropy
 
-        # U-curve: neutral at extremes, reactive in the middle
-        #   ratio > 0.6 (high loss, early training): neutral (1.0)
-        #   ratio 0.2-0.6 (active learning): dip to 0.8 (less momentum, faster reaction)
-        #   ratio < 0.2 (converging): rise to 1.2 (more momentum, stability)
         if ratio > 0.6:
             pgm_scale = 1.0
         elif ratio > 0.2:
-            pgm_scale = 0.8 + 0.5 * (ratio - 0.2)  # 1.0→0.8
+            pgm_scale = 0.8 + 0.5 * (ratio - 0.2)
         else:
-            pgm_scale = 0.8 + 2.0 * (0.2 - ratio)  # 0.8→1.2
+            pgm_scale = 0.8 + 2.0 * (0.2 - ratio)
         self._perplexity_scale = max(0.7, min(1.3, pgm_scale))
 
-        # ---- LVS v2: Window-based trend detection ----
-        # Ring buffer: append + trim
+        # ---- LVS v3: Multi-scale trend detection ----
         self._loss_window.append(loss_val)
         if len(self._loss_window) > self._lvs_window_size:
             self._loss_window.pop(0)
@@ -131,75 +156,47 @@ class VelvetOptimizer(Optimizer):
             self._lvs_confidence = 0.0
             return
 
-        # Linear regression (OLS) over window: loss = a + b*t
-        sum_t = n * (n - 1) / 2.0
-        sum_t2 = n * (n - 1) * (2 * n - 1) / 6.0
-        sum_y = 0.0
-        sum_ty = 0.0
-        for i, y in enumerate(self._loss_window):
-            sum_y += y
-            sum_ty += i * y
+        # Primary: full window regression
+        slope, r_squared, mean_y = self._ols_trend(self._loss_window)
 
-        denom = n * sum_t2 - sum_t * sum_t
-        if denom < 1e-12:
-            self._entropy_scale = 1.0
-            self._lvs_confidence = 0.0
-            return
+        # Fallback: if R² is low on full window, try short window
+        # Short window captures recent trends that get diluted in the long window
+        if r_squared < 0.3 and n > self._lvs_short_window:
+            short_slice = self._loss_window[-self._lvs_short_window:]
+            short_slope, short_r2, short_mean = self._ols_trend(short_slice)
+            if short_r2 > r_squared:
+                slope, r_squared, mean_y = short_slope, short_r2, short_mean
 
-        slope = (n * sum_ty - sum_t * sum_y) / denom
-        intercept = (sum_y - slope * sum_t) / n
-
-        # R² = 1 - SS_res / SS_tot
-        mean_y = sum_y / n
-        ss_tot = 0.0
-        ss_res = 0.0
-        for i, y in enumerate(self._loss_window):
-            ss_tot += (y - mean_y) ** 2
-            predicted = intercept + slope * i
-            ss_res += (y - predicted) ** 2
-
-        r_squared = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
-        r_squared = max(0.0, min(1.0, r_squared))
         self._lvs_confidence = r_squared
 
         # Phase-adaptive range: early=wide [0.7, 1.3], late=narrow [0.9, 1.1]
         phase = min(1.0, self._global_step / max(self._lvs_phase_steps, 1))
-        max_boost = 1.3 - 0.2 * phase   # 1.3 early -> 1.1 late
-        max_damp = 0.7 + 0.2 * phase     # 0.7 early -> 0.9 late
+        max_boost = 1.3 - 0.2 * phase
+        max_damp = 0.7 + 0.2 * phase
 
         # Normalize slope relative to mean loss magnitude
         baseline = abs(mean_y) * 0.01 + 1e-8
         norm_slope = max(-1.0, min(1.0, slope / baseline))
 
-        # Map slope to raw scale:
-        #   slope < 0 (improving)  → between 1.0 and max_boost (mild boost)
-        #   slope > 0 (diverging)  → between max_damp and 1.0
-        #   slope ~ 0 (stalled)    → max_boost (boost to escape plateau)
+        # Map slope to raw scale
         if norm_slope <= 0:
             raw_scale = 1.0 + (max_boost - 1.0) * (1.0 + norm_slope)
         else:
             raw_scale = max_boost - (max_boost - max_damp) * norm_slope
 
-        # Blend with confidence: low R² → new_scale near 1.0
+        # Blend with confidence + momentum for smooth transitions
         new_scale = 1.0 + r_squared * (raw_scale - 1.0)
-
-        # Momentum: smooth transitions — don't snap to neutral when R² drops
-        # If R² was high (boosting at 1.2) and drops to 0, scale decays:
-        #   step 1: 1.18, step 10: 1.12, step 20: 1.06, step 50: ~1.01
         self._entropy_scale = self._lvs_momentum * self._entropy_scale + (1.0 - self._lvs_momentum) * new_scale
 
         # ---- Stall damping: when loss stops improving, dampen to settle ----
-        # EMA tracks a slow-moving loss baseline
         if self._loss_ema is None:
             self._loss_ema = mean_y
         else:
             self._loss_ema += self._loss_ema_alpha * (mean_y - self._loss_ema)
 
-        # If current window mean is above EMA (stalling/worsening), dampen
         if self._loss_ema > 1e-8:
             stall_gap = (mean_y - self._loss_ema) / self._loss_ema
-            if stall_gap > 0.005:  # loss is >0.5% above EMA baseline
-                # Progressive damping: harder stall → more damping, capped at max_damp
+            if stall_gap > 0.005:
                 damp = max(max_damp, 1.0 - min(stall_gap * 2, 0.15))
                 self._entropy_scale = min(self._entropy_scale, damp)
 
