@@ -311,6 +311,8 @@ class Trainer:
                     log_parts.append(f"b1={self.optimizer.effective_beta1:.3f}")
                     log_parts.append(f"lvs={self.optimizer.lr_scale:.3f}")
                     log_parts.append(f"sig={self.optimizer.lvs_confidence:.2f}")
+                    if self.optimizer.is_bursting:
+                        log_parts.append("BURST")
 
                 print(" | ".join(log_parts))
 

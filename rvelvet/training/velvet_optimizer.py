@@ -74,6 +74,13 @@ class VelvetOptimizer(Optimizer):
         self._lvs_confidence = 0.0  # signal strength for logging
         self._entropy_scale = 1.0
         self._lvs_momentum = 0.9  # light smoothing
+        # Plateau burst: cyclical LR spike to escape local minima
+        self._plateau_counter = 0       # steps with |gap| < threshold
+        self._plateau_threshold = 0.003 # gap below this = plateau
+        self._plateau_patience = 200    # steps before triggering burst
+        self._burst_duration = 50       # burst lasts this many steps
+        self._burst_multiplier = 2.0    # LR multiplied by this during burst
+        self._burst_step = -1           # step when burst started (-1 = inactive)
         # PGM state: perplexity-guided momentum (for beta1)
         self._perplexity_scale = 1.0
         self._last_grad_norm = 0.0
@@ -167,8 +174,34 @@ class VelvetOptimizer(Optimizer):
         # Light momentum for smoothing (0.9 = responds in ~10 steps)
         self._entropy_scale = self._lvs_momentum * self._entropy_scale + (1.0 - self._lvs_momentum) * raw_scale
 
-        # Clamp to phase range
-        self._entropy_scale = max(max_damp, min(max_boost, self._entropy_scale))
+        # ---- Plateau burst: cyclical LR spike to escape local minima ----
+        # Detect plateau: gap near zero for too long
+        if abs(gap) < self._plateau_threshold:
+            self._plateau_counter += 1
+        else:
+            self._plateau_counter = max(0, self._plateau_counter - 5)  # fast reset
+
+        # Check if we're currently in a burst
+        if self._burst_step >= 0:
+            # Active burst: cosine-shaped spike (ramp up, peak, ramp down)
+            burst_progress = (self._global_step - self._burst_step) / self._burst_duration
+            if burst_progress < 1.0:
+                # Cosine spike: 1.0 → burst_multiplier → 1.0
+                spike = 0.5 * (1.0 - math.cos(2.0 * math.pi * burst_progress))
+                burst_scale = 1.0 + (self._burst_multiplier - 1.0) * spike
+                self._entropy_scale *= burst_scale
+            else:
+                # Burst finished, reset
+                self._burst_step = -1
+                self._plateau_counter = 0
+        elif self._plateau_counter >= self._plateau_patience and self._global_step > 500:
+            # Trigger new burst (only after warmup)
+            self._burst_step = self._global_step
+            self._plateau_counter = 0
+
+        # Clamp (allow burst to exceed normal max_boost temporarily)
+        burst_max = max_boost * self._burst_multiplier if self._burst_step >= 0 else max_boost
+        self._entropy_scale = max(max_damp, min(burst_max, self._entropy_scale))
 
     @property
     def effective_lr(self) -> float:
@@ -204,6 +237,16 @@ class VelvetOptimizer(Optimizer):
     def lvs_phase(self) -> float:
         """Training phase (0.0=early/reactive, 1.0=late/stable)."""
         return min(1.0, self._global_step / max(self._lvs_phase_steps, 1))
+
+    @property
+    def is_bursting(self) -> bool:
+        """True if a plateau burst is currently active."""
+        return self._burst_step >= 0
+
+    @property
+    def plateau_counter(self) -> int:
+        """Steps spent on current plateau (triggers burst at patience)."""
+        return self._plateau_counter
 
     @property
     def last_grad_norm(self) -> float:
