@@ -1,4 +1,4 @@
-"""Velvet Optimizer — AdamW + PGM + LVS v4.
+"""Velvet Optimizer — AdamW + PGM + LVS v5.
 
 Combines two adaptive mechanisms on top of AdamW:
 
@@ -7,11 +7,11 @@ Combines two adaptive mechanisms on top of AdamW:
     - Active learning zone: less momentum (faster reaction)
     - Converging zone: more momentum (stability)
 
-  LVS v4 (Loss-Velocity Scaling):
-    - Dual-EMA crossover: fast EMA (~20 steps) vs slow EMA (~100 steps)
-    - Fast < slow = improving → boost LR
-    - Fast > slow = worsening → dampen LR
-    - Works at ALL loss scales (no R² gate that dies in late training)
+  LVS v5 (Loss-Velocity Scaling):
+    - Two slow EMAs: current (~100 steps) vs anchor (~500 steps)
+    - Current < anchor = loss has improved → boost LR (floor 50%)
+    - Current > anchor = loss worsening → dampen LR
+    - Ultra-stable: both EMAs heavily smoothed, no batch-noise flipping
     - Phase-adaptive range: early [0.7, 1.3], late [0.9, 1.1]
 
 Three backends (auto-detected, priority order):
@@ -65,15 +65,15 @@ class VelvetOptimizer(Optimizer):
         )
         super().__init__(params, defaults)
 
-        # LVS v4 state: dual-EMA crossover (replaces R²-gated approach)
-        self._ema_fast = None   # ~20 step effective window
-        self._ema_slow = None   # ~100 step effective window
-        self._ema_fast_alpha = 2.0 / (20 + 1)   # ≈ 0.095
-        self._ema_slow_alpha = 2.0 / (100 + 1)  # ≈ 0.0198
+        # LVS v5 state: dual slow-EMA crossover
+        self._ema_current = None    # ~100 step window (tracks recent loss)
+        self._ema_anchor = None     # ~500 step window (tracks long-term baseline)
+        self._ema_current_alpha = 2.0 / (100 + 1)   # ≈ 0.0198
+        self._ema_anchor_alpha = 2.0 / (500 + 1)    # ≈ 0.00399
         self._lvs_phase_steps = 20000  # overridden by set_training_steps()
-        self._lvs_confidence = 0.0  # kept for logging (how strong is the signal)
+        self._lvs_confidence = 0.0  # signal strength for logging
         self._entropy_scale = 1.0
-        self._lvs_momentum = 0.85  # smooth scale transitions
+        self._lvs_momentum = 0.9  # light smoothing
         # PGM state: perplexity-guided momentum (for beta1)
         self._perplexity_scale = 1.0
         self._last_grad_norm = 0.0
@@ -95,10 +95,10 @@ class VelvetOptimizer(Optimizer):
     def set_loss_metrics(self, loss_val: float, vocab_size: int):
         """Update both LVS (LR scaling) and PGM (momentum scaling).
 
-        LVS v4: Dual-EMA crossover — fast EMA vs slow EMA.
-        When fast < slow, the loss is trending down → boost.
-        When fast > slow, the loss is trending up → dampen.
-        Works at all loss scales, no R² gate.
+        LVS v5: Current EMA (~100 steps) vs Anchor EMA (~500 steps).
+        When current < anchor, loss has improved over long term → boost.
+        When current > anchor, loss is worsening → dampen.
+        Both EMAs are heavily smoothed — no batch-noise flipping.
 
         PGM: Perplexity-guided momentum — U-curve based on loss ratio.
         """
@@ -117,59 +117,54 @@ class VelvetOptimizer(Optimizer):
             pgm_scale = 0.8 + 2.0 * (0.2 - ratio)
         self._perplexity_scale = max(0.7, min(1.3, pgm_scale))
 
-        # ---- LVS v4: Dual-EMA crossover ----
+        # ---- LVS v5: Dual slow-EMA crossover ----
         # Initialize EMAs on first call
-        if self._ema_fast is None:
-            self._ema_fast = loss_val
-            self._ema_slow = loss_val
+        if self._ema_current is None:
+            self._ema_current = loss_val
+            self._ema_anchor = loss_val
             self._entropy_scale = 1.0
             self._lvs_confidence = 0.0
             return
 
-        # Update EMAs
-        self._ema_fast += self._ema_fast_alpha * (loss_val - self._ema_fast)
-        self._ema_slow += self._ema_slow_alpha * (loss_val - self._ema_slow)
+        # Update both EMAs
+        self._ema_current += self._ema_current_alpha * (loss_val - self._ema_current)
+        self._ema_anchor += self._ema_anchor_alpha * (loss_val - self._ema_anchor)
 
-        # Crossover signal: normalized gap between fast and slow
-        # Negative = fast < slow = improving, Positive = fast > slow = worsening
-        mean_ema = (self._ema_fast + self._ema_slow) / 2.0
-        if mean_ema < 1e-8:
-            self._entropy_scale = 1.0
-            self._lvs_confidence = 0.0
+        # Gap: normalized difference between current and anchor
+        # Negative = current < anchor = loss has improved → boost
+        # Positive = current > anchor = loss worsening → dampen
+        if self._ema_anchor < 1e-8:
             return
 
-        gap = (self._ema_fast - self._ema_slow) / mean_ema
-        # Clamp to [-1, 1]
+        gap = (self._ema_current - self._ema_anchor) / self._ema_anchor
         gap = max(-1.0, min(1.0, gap))
 
-        # Confidence: how far apart the EMAs are (absolute gap)
-        # Large gap = strong signal, small gap = uncertain
-        self._lvs_confidence = min(1.0, abs(gap) * 20.0)  # 5% gap → confidence 1.0
+        # Signal strength for logging (absolute gap, scaled)
+        self._lvs_confidence = min(1.0, abs(gap) * 10.0)
 
         # Phase-adaptive range: early=wide [0.7, 1.3], late=narrow [0.9, 1.1]
         phase = min(1.0, self._global_step / max(self._lvs_phase_steps, 1))
         max_boost = 1.3 - 0.2 * phase
         max_damp = 0.7 + 0.2 * phase
 
-        # Map gap to raw scale:
-        #   gap < -deadzone (improving)  → boost with floor guarantee
-        #   gap > +deadzone (worsening)  → dampen proportionally
-        #   |gap| < deadzone (flat)      → neutral: 1.0
-        deadzone = 0.001  # 0.1% gap = flat
-        if gap < -deadzone:
-            # Improving: scale proportional to gap, but with a FLOOR
-            # Even a tiny improvement gets at least 30% of max boost
-            strength = min(1.0, abs(gap) * 10.0)
-            strength = max(0.3, strength)  # floor: always at least 30% boost
+        # Map gap to scale:
+        #   gap < 0 (improving)  → boost, floor at 50% of max boost
+        #   gap > 0 (worsening)  → dampen proportionally
+        #   gap ≈ 0 (converged)  → neutral
+        if gap < -0.001:
+            # Improving: proportional + floor guarantee
+            # 1% improvement → strength 0.5 (floor), 10%+ → strength 1.0 (max)
+            strength = min(1.0, abs(gap) * 5.0)
+            strength = max(0.5, strength)  # FLOOR: at least 50% of max boost
             raw_scale = 1.0 + (max_boost - 1.0) * strength
-        elif gap > deadzone:
-            # Worsening: proportional damping, no floor needed
-            strength = min(1.0, gap * 10.0)
+        elif gap > 0.001:
+            # Worsening: proportional damping
+            strength = min(1.0, gap * 5.0)
             raw_scale = 1.0 - (1.0 - max_damp) * strength
         else:
             raw_scale = 1.0
 
-        # Momentum: smooth transitions
+        # Light momentum for smoothing (0.9 = responds in ~10 steps)
         self._entropy_scale = self._lvs_momentum * self._entropy_scale + (1.0 - self._lvs_momentum) * raw_scale
 
         # Clamp to phase range
