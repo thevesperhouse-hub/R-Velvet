@@ -80,7 +80,8 @@ class VelvetOptimizer(Optimizer):
         self._lvs_phase_steps = 20000  # overridden by set_training_steps()
         self._lvs_confidence = 0.0  # signal strength for logging
         self._entropy_scale = 1.0
-        self._lvs_momentum = 0.9  # light smoothing
+        self._lvs_momentum_up = 0.8    # fast ramp-up (responds in ~5 steps)
+        self._lvs_momentum_down = 0.995  # slow decay (half-life ~140 steps)
         # Plateau burst: cyclical LR spike to escape local minima
         self._plateau_counter = 0       # steps with |gap| < threshold
         self._plateau_threshold = 0.005 # log-space gap below this = plateau
@@ -207,8 +208,12 @@ class VelvetOptimizer(Optimizer):
         else:
             raw_scale = 1.0
 
-        # Light momentum for smoothing (0.9 = responds in ~10 steps)
-        self._entropy_scale = self._lvs_momentum * self._entropy_scale + (1.0 - self._lvs_momentum) * raw_scale
+        # Asymmetric momentum: fast up, slow down (holds boost longer)
+        if raw_scale >= self._entropy_scale:
+            momentum = self._lvs_momentum_up    # rising: react fast
+        else:
+            momentum = self._lvs_momentum_down  # falling: hold the boost
+        self._entropy_scale = momentum * self._entropy_scale + (1.0 - momentum) * raw_scale
 
         # ---- Plateau burst: cyclical LR spike to escape local minima ----
         # Detect plateau: gap near zero for too long
