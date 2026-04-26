@@ -67,9 +67,12 @@ class VelvetOptimizer(Optimizer):
         self._loss_window = []
         self._lvs_window_size = 64
         self._lvs_min_window = 16
-        self._lvs_phase_steps = 20000
+        self._lvs_phase_steps = 20000  # overridden by set_training_steps()
         self._lvs_confidence = 0.0
         self._entropy_scale = 1.0
+        # Stall detection: EMA baseline for plateau damping
+        self._loss_ema = None
+        self._loss_ema_alpha = 0.02  # slow-moving baseline
         # PGM state: perplexity-guided momentum (for beta1)
         self._perplexity_scale = 1.0
         self._last_grad_norm = 0.0
@@ -83,6 +86,10 @@ class VelvetOptimizer(Optimizer):
             self._kernel_backend = "pytorch"
 
     # ---- Adaptive signals (set by training loop) ----
+
+    def set_training_steps(self, max_steps: int):
+        """Set total training steps so LVS phase tracks actual run length."""
+        self._lvs_phase_steps = max(max_steps, 1)
 
     def set_loss_metrics(self, loss_val: float, vocab_size: int):
         """Update both LVS (LR scaling) and PGM (momentum scaling).
@@ -173,6 +180,21 @@ class VelvetOptimizer(Optimizer):
 
         # Blend with confidence: low R² → scale stays near 1.0
         self._entropy_scale = 1.0 + r_squared * (raw_scale - 1.0)
+
+        # ---- Stall damping: when loss stops improving, dampen to settle ----
+        # EMA tracks a slow-moving loss baseline
+        if self._loss_ema is None:
+            self._loss_ema = mean_y
+        else:
+            self._loss_ema += self._loss_ema_alpha * (mean_y - self._loss_ema)
+
+        # If current window mean is above EMA (stalling/worsening), dampen
+        if self._loss_ema > 1e-8:
+            stall_gap = (mean_y - self._loss_ema) / self._loss_ema
+            if stall_gap > 0.005:  # loss is >0.5% above EMA baseline
+                # Progressive damping: harder stall → more damping, capped at max_damp
+                damp = max(max_damp, 1.0 - min(stall_gap * 2, 0.15))
+                self._entropy_scale = min(self._entropy_scale, damp)
 
     @property
     def effective_lr(self) -> float:

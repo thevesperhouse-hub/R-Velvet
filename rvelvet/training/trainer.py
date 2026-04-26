@@ -6,6 +6,7 @@ gradient accumulation, LR scheduling, checkpointing, and logging.
 """
 
 import os
+import csv
 import math
 import time
 import torch
@@ -166,6 +167,19 @@ class Trainer:
 
         self.scheduler = self._build_scheduler(max_steps)
 
+        # Tell VelvetOptimizer the actual run length for phase-adaptive LVS
+        if self.use_velvet:
+            self.optimizer.set_training_steps(max_steps)
+
+        # CSV metrics log
+        csv_path = self.output_dir / "metrics.csv"
+        csv_file = open(csv_path, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_headers = ['step', 'loss', 'ce', 'lr', 'elapsed']
+        if self.use_velvet:
+            csv_headers += ['beta1', 'lvs_scale', 'r2', 'pgm_scale', 'grad_norm', 'lvs_phase']
+        csv_writer.writerow(csv_headers)
+
         loader = DataLoader(
             self.train_dataset,
             batch_size=tcfg.batch_size,
@@ -296,6 +310,21 @@ class Trainer:
 
                 print(" | ".join(log_parts))
 
+                # CSV log
+                csv_row = [self.global_step, f"{avg_loss:.6f}", f"{avg_dict.get('ce', 0):.6f}",
+                           f"{lr_now:.6e}", f"{dt:.2f}"]
+                if self.use_velvet:
+                    csv_row += [
+                        f"{self.optimizer.effective_beta1:.4f}",
+                        f"{self.optimizer.lr_scale:.4f}",
+                        f"{self.optimizer.lvs_confidence:.4f}",
+                        f"{self.optimizer.perplexity_scale:.4f}",
+                        f"{self.optimizer.last_grad_norm:.4f}",
+                        f"{self.optimizer.lvs_phase:.4f}",
+                    ]
+                csv_writer.writerow(csv_row)
+                csv_file.flush()
+
                 # Wandb
                 if tcfg.wandb and not tcfg.debug:
                     try:
@@ -322,7 +351,9 @@ class Trainer:
         if not tcfg.debug:
             self._save_checkpoint(tag='final')
 
+        csv_file.close()
         print(f"\nTraining complete: {self.global_step} steps")
+        print(f"Metrics saved: {csv_path}")
 
     def _save_checkpoint(self, tag=None):
         """Save model + optimizer + scheduler + step."""
