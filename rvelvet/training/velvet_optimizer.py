@@ -191,16 +191,13 @@ class VelvetOptimizer(Optimizer):
         max_boost = 1.3 - 0.2 * phase
         max_damp = 0.7 + 0.2 * phase
 
-        # Map gap to scale (thresholds calibrated for log-space):
-        #   gap < -0.005 (improving ≥0.5%)  → boost, floor at 50%
-        #   gap > +0.005 (worsening ≥0.5%)  → dampen proportionally
+        # Map gap to scale (binary boost — no proportional decay):
+        #   gap < -0.005 (improving at all)  → FULL boost
+        #   gap > +0.005 (worsening)         → dampen proportionally
         #   |gap| < 0.005 (stable)           → neutral
         if gap < -0.005:
-            # Improving: proportional + floor guarantee
-            # 0.5% → strength 0.5 (floor), 5%+ → strength 1.0 (max)
-            strength = min(1.0, abs(gap) / 0.05)
-            strength = max(0.5, strength)  # FLOOR: at least 50% of max boost
-            raw_scale = 1.0 + (max_boost - 1.0) * strength
+            # Improving: full max boost — as long as loss is dropping, push hard
+            raw_scale = max_boost
         elif gap > 0.005:
             # Worsening: proportional damping
             strength = min(1.0, gap / 0.05)
