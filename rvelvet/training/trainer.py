@@ -213,6 +213,8 @@ class Trainer:
         print(f"Optimizer: {optim_name}", end="")
         if self.use_velvet:
             print(f" (backend={self.optimizer.kernel_backend}, PGM+LVS)")
+            print(f"  EMA windows: current={self.optimizer._current_window}, "
+                  f"anchor={self.optimizer._anchor_window_min}→{self.optimizer._anchor_window_max}")
         else:
             print()
         print(f"Effective batch: {tcfg.batch_size * accum_steps}")

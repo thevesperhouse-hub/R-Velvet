@@ -1,4 +1,4 @@
-"""Velvet Optimizer — AdamW + PGM + LVS v5.
+"""Velvet Optimizer — AdamW + PGM + LVS v5.1.
 
 Combines two adaptive mechanisms on top of AdamW:
 
@@ -7,12 +7,15 @@ Combines two adaptive mechanisms on top of AdamW:
     - Active learning zone: less momentum (faster reaction)
     - Converging zone: more momentum (stability)
 
-  LVS v5 (Loss-Velocity Scaling):
-    - Two slow EMAs: current (~100 steps) vs anchor (~500 steps)
-    - Current < anchor = loss has improved → boost LR (floor 50%)
+  LVS v5.1 (Loss-Velocity Scaling):
+    - Two slow EMAs: current vs anchor (windows scaled to run length)
+    - Current window: 3% of max_steps (50-300 steps)
+    - Anchor window: grows from 10% to 30% of max_steps over training
+    - Current < anchor = loss improved → boost LR (floor 50%)
     - Current > anchor = loss worsening → dampen LR
     - Ultra-stable: both EMAs heavily smoothed, no batch-noise flipping
     - Phase-adaptive range: early [0.7, 1.3], late [0.9, 1.1]
+    - Plateau burst: cyclical 2x LR spike to escape local minima
 
 Three backends (auto-detected, priority order):
   1. Triton fused kernel — single kernel per param
@@ -65,11 +68,15 @@ class VelvetOptimizer(Optimizer):
         )
         super().__init__(params, defaults)
 
-        # LVS v5 state: dual slow-EMA crossover
-        self._ema_current = None    # ~100 step window (tracks recent loss)
-        self._ema_anchor = None     # ~500 step window (tracks long-term baseline)
-        self._ema_current_alpha = 2.0 / (100 + 1)   # ≈ 0.0198
-        self._ema_anchor_alpha = 2.0 / (500 + 1)    # ≈ 0.00399
+        # LVS v5 state: dual slow-EMA crossover (windows scaled to run length)
+        self._ema_current = None
+        self._ema_anchor = None
+        # Default windows (overridden by set_training_steps)
+        self._current_window = 100
+        self._anchor_window_min = 200   # start of run
+        self._anchor_window_max = 500   # end of run (grows linearly)
+        self._ema_current_alpha = 2.0 / (100 + 1)
+        self._ema_anchor_alpha = 2.0 / (200 + 1)
         self._lvs_phase_steps = 20000  # overridden by set_training_steps()
         self._lvs_confidence = 0.0  # signal strength for logging
         self._entropy_scale = 1.0
@@ -96,8 +103,28 @@ class VelvetOptimizer(Optimizer):
     # ---- Adaptive signals (set by training loop) ----
 
     def set_training_steps(self, max_steps: int):
-        """Set total training steps so LVS phase tracks actual run length."""
+        """Set total training steps and compute adaptive EMA windows.
+
+        Windows scale with run length (Chinchilla-inspired):
+          - Current EMA: 3% of max_steps (min 50, max 300)
+          - Anchor EMA: starts at 10% → grows to 30% over training
+        Short runs (500 steps): current=50, anchor=50→150
+        Long runs (100K steps): current=300, anchor=300→300 (capped)
+        """
         self._lvs_phase_steps = max(max_steps, 1)
+
+        # Adaptive window sizing
+        self._current_window = max(50, min(300, int(max_steps * 0.03)))
+        self._anchor_window_min = max(100, min(300, int(max_steps * 0.10)))
+        self._anchor_window_max = max(200, min(500, int(max_steps * 0.30)))
+
+        # Ensure anchor_min <= anchor_max
+        if self._anchor_window_min > self._anchor_window_max:
+            self._anchor_window_min = self._anchor_window_max
+
+        # Set initial alphas
+        self._ema_current_alpha = 2.0 / (self._current_window + 1)
+        self._ema_anchor_alpha = 2.0 / (self._anchor_window_min + 1)
 
     def set_loss_metrics(self, loss_val: float, vocab_size: int):
         """Update both LVS (LR scaling) and PGM (momentum scaling).
@@ -132,6 +159,11 @@ class VelvetOptimizer(Optimizer):
             self._entropy_scale = 1.0
             self._lvs_confidence = 0.0
             return
+
+        # Adaptive anchor window: grows linearly from min → max over training
+        progress = min(1.0, self._global_step / max(self._lvs_phase_steps, 1))
+        anchor_window = self._anchor_window_min + (self._anchor_window_max - self._anchor_window_min) * progress
+        self._ema_anchor_alpha = 2.0 / (anchor_window + 1)
 
         # Update both EMAs
         self._ema_current += self._ema_current_alpha * (loss_val - self._ema_current)
@@ -247,6 +279,12 @@ class VelvetOptimizer(Optimizer):
     def plateau_counter(self) -> int:
         """Steps spent on current plateau (triggers burst at patience)."""
         return self._plateau_counter
+
+    @property
+    def anchor_window(self) -> float:
+        """Current anchor EMA window size (grows over training)."""
+        progress = min(1.0, self._global_step / max(self._lvs_phase_steps, 1))
+        return self._anchor_window_min + (self._anchor_window_max - self._anchor_window_min) * progress
 
     @property
     def last_grad_norm(self) -> float:
