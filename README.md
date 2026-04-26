@@ -219,6 +219,117 @@ Enable multi-pass reasoning. Freezes all base parameters, only trains LoRA bank 
 
 Deep supervision: each iteration's concepts are expanded → lm_head → CE, averaged across iterations.
 
+## VelvetOptimizer
+
+Custom optimizer built on AdamW with two adaptive mechanisms: **PGM** (Perplexity-Guided Momentum) and **LVS** (Loss-Velocity Scaling). Converges faster than AdamW and maintains advantage through late training.
+
+`rvelvet/training/velvet_optimizer.py`
+
+### PGM — Perplexity-Guided Momentum
+
+Adapts beta1 dynamically based on normalized loss ratio (loss / max_entropy). Uses a U-curve mapping:
+
+| Training Zone | Loss Ratio | beta1 Effect |
+|---|---|---|
+| Random (high loss) | > 0.6 | beta1 x 1.0 (normal momentum) |
+| Active learning | 0.2 — 0.6 | beta1 x 0.8-1.0 (less momentum, faster reaction) |
+| Converging (low loss) | < 0.2 | beta1 x 0.8-1.1 (more momentum, stability) |
+
+Clamped to [0.7, 1.3] range. Zero overhead — pure scalar math.
+
+### LVS v5.2 — Loss-Velocity Scaling
+
+Scales the learning rate based on whether the model is actively improving. Uses dual-EMA crossover in **log-space** with adaptive windows and asymmetric momentum.
+
+**Core mechanism:**
+1. Two EMAs track `log(loss)` — a fast "current" EMA and a slow "anchor" EMA
+2. If current < anchor (loss improving) → **full LR boost** (max_boost)
+3. If current > anchor (loss worsening) → proportional LR dampening
+4. If current ≈ anchor (plateau) → neutral (1.0)
+
+**Why log-space?** In linear space, as absolute loss decreases, percentage changes naturally shrink even if relative improvement rate is constant. This caused the signal to decay after ~300 steps. In log-space, exponential decay becomes linear → constant EMA gap → stable signal.
+
+**Adaptive EMA windows (Chinchilla-inspired):** Windows scale with total training steps instead of being hardcoded:
+- Current EMA: 3% of max_steps (clamped 50-300)
+- Anchor EMA: starts at 10%, grows to 30% over training (clamped 100-500)
+
+| Run Length | Current Window | Anchor Window |
+|---|---|---|
+| 500 steps (debug) | 50 | 100 → 200 |
+| 3,500 steps (bench) | 105 | 300 → 500 |
+| 100K steps (prod) | 300 | 300 → 500 |
+
+**Asymmetric momentum:** LVS ramps up fast (momentum 0.8, ~5 steps) but decays slowly (momentum 0.995, half-life ~140 steps). This holds the LR boost much longer after peak signal.
+
+**Binary boost:** When the model is improving at all (gap < -0.005 in log-space), LVS applies the full phase-adaptive max_boost — no proportional decay. This prevents the boost from eroding as improvement rate naturally slows.
+
+**Phase-adaptive range:**
+
+| Phase | Boost Range | Dampen Range |
+|---|---|---|
+| Early (step 0) | up to 1.3x | down to 0.7x |
+| Late (final step) | up to 1.1x | down to 0.9x |
+
+**Plateau burst:** If the EMA gap stays below 0.5% for 200 consecutive steps (after warmup), triggers a cosine-shaped LR spike (2x for 50 steps) to escape local minima.
+
+### Kernel Backends
+
+Three backends, auto-detected by priority:
+
+| Backend | Requirement | Speed |
+|---|---|---|
+| Triton | `triton` package + CUDA GPU | Fastest (fused kernel) |
+| CUDA | CUDA GPU + cpp_extension | ~80% of Triton |
+| PyTorch | CPU or no GPU extensions | Baseline |
+
+### Usage
+
+```python
+from rvelvet.training.velvet_optimizer import VelvetOptimizer
+
+optimizer = VelvetOptimizer(
+    model.parameters(),
+    lr=5e-4,
+    betas=(0.9, 0.999),
+    weight_decay=1e-3,
+    max_grad_norm=1.0,
+    entropy_adaptive=True,      # enable LVS
+    perplexity_guided=True,     # enable PGM
+)
+
+# Tell LVS the total run length (required for adaptive windows)
+optimizer.set_training_steps(max_steps=100000)
+
+for step in range(max_steps):
+    loss = model(batch)
+    loss.backward()
+    optimizer.clip_grad_norm_()
+    optimizer.step()
+    optimizer.zero_grad()
+
+    # Feed loss to LVS + PGM (after optimizer.step)
+    optimizer.set_loss_metrics(loss.item(), vocab_size=50257)
+
+    # Logging
+    print(f"lr={optimizer.effective_lr:.2e} "
+          f"beta1={optimizer.effective_beta1:.3f} "
+          f"lvs={optimizer.lr_scale:.3f} "
+          f"sig={optimizer.lvs_confidence:.2f}")
+```
+
+To use AdamW instead, set `optimizer: adamw` in the training config.
+
+### Plotting Training Runs
+
+```bash
+# Single run (generates 8-panel plot for Velvet, 4-panel for AdamW)
+python scripts/plot_run.py outputs/phase1_pretrain/metrics.csv
+
+# Compare Velvet vs AdamW
+python scripts/plot_run.py outputs/velvet/metrics.csv outputs/adamw/metrics.csv \
+    --labels Velvet AdamW
+```
+
 ## Testing
 
 ```bash
@@ -252,7 +363,13 @@ R-Velvet/
 │   │   └── text_dataset.py          # Memmap text dataset
 │   └── training/
 │       ├── losses.py                # Per-phase loss computation
-│       └── trainer.py               # Shared training loop
+│       ├── trainer.py               # Shared training loop
+│       ├── velvet_optimizer.py      # VelvetOptimizer (AdamW + PGM + LVS)
+│       └── kernels/
+│           ├── velvet_triton.py     # Triton fused kernel
+│           ├── velvet_cuda.py       # CUDA fallback kernel
+│           ├── fused_ce.py          # Fused cross-entropy
+│           └── era_triton.py        # ERA Triton kernel
 ├── configs/
 │   ├── config.yaml
 │   ├── model/
@@ -260,7 +377,10 @@ R-Velvet/
 │   └── data/
 ├── scripts/
 │   ├── train.py                     # Hydra entry point
-│   └── tokenize_data.py             # Text → .bin tokenizer
+│   ├── tokenize_data.py             # Text → .bin tokenizer
+│   ├── plot_run.py                  # Training metrics visualization
+│   ├── train_tokenizer.py           # BPE tokenizer training
+│   └── download_culturax.py         # CulturaX dataset downloader
 ├── tests/
 │   ├── test_architecture.py
 │   ├── test_acr.py
