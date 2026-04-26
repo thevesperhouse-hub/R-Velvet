@@ -1,0 +1,36 @@
+# Phase 3: Iterative Reasoning finetuning (LoRA + halting)
+phase: phase3_iterative
+use_acr: true
+use_iterative_reasoning: true
+optimizer: adamw           # adamw or velvet
+
+lr: 5e-4
+min_lr: 5e-5
+weight_decay: 0.01
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+
+batch_size: 16
+grad_accum_steps: 8      # effective batch = 128
+max_steps: 30000
+warmup_steps: 500
+lr_schedule: cosine
+
+# Phase 3 loss weights
+lambda_halting: 0.1
+lambda_deep_supervision: 0.1
+
+amp: bf16
+compile: false
+
+save_every: 1000
+keep_last_n: 5
+resume_from: null         # set to phase2 checkpoint path
+
+log_every: 50
+wandb: false
+wandb_project: r-velvet
+wandb_run: phase3
+
+debug: false

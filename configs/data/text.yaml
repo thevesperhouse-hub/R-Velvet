@@ -1,0 +1,7 @@
+# Text dataset configuration
+train_path: data/train.bin
+val_path: data/val.bin
+seq_len: 2048
+stride: null              # null = seq_len (no overlap)
+tokenizer: data/velvet_tok      # local BPE tokenizer (or HuggingFace name)
+num_workers: 4

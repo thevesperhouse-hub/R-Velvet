@@ -1,0 +1,21 @@
+# Base model (~50M params)
+name: base
+vocab_size: 32000
+d_model: 384
+n_local_layers: 6
+n_global_layers: 8
+n_local_heads: 6
+n_global_heads: 8
+window_size: 512
+segment_size: 512
+n_concepts: 1
+n_refine_layers: 2
+memory_size: 256
+n_read_steps: 2
+ffn_mult: 4.0
+dropout: 0.0
+max_seq_len: 8192
+max_reasoning_iterations: 8
+lora_rank: 8
+halt_threshold: 0.5
+lambda_p: 0.5

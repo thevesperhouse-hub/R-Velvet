@@ -1,0 +1,38 @@
+# Phase 2: ACR finetuning (enable Adaptive Computation Routing)
+phase: phase2_acr
+use_acr: true
+use_iterative_reasoning: false
+optimizer: adamw           # adamw or velvet
+
+lr: 1e-4
+lr_base_factor: 0.1     # base params at lr * 0.1
+min_lr: 1e-5
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+
+batch_size: 16
+grad_accum_steps: 8      # effective batch = 128
+max_steps: 50000
+warmup_steps: 1000
+lr_schedule: cosine
+
+# ACR loss weights
+lambda_load_balance: 0.01
+lambda_entropy: 0.001
+lambda_compute_cost: 0.005
+
+amp: bf16
+compile: false
+
+save_every: 1000
+keep_last_n: 5
+resume_from: null         # set to phase1 checkpoint path
+
+log_every: 50
+wandb: false
+wandb_project: r-velvet
+wandb_run: phase2
+
+debug: false

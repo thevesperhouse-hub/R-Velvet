@@ -1,0 +1,21 @@
+# Small model (~5M params) — for debugging and quick iteration
+name: small
+vocab_size: 32000
+d_model: 256
+n_local_layers: 4
+n_global_layers: 4
+n_local_heads: 4
+n_global_heads: 4
+window_size: 256
+segment_size: 256
+n_concepts: 1
+n_refine_layers: 1
+memory_size: 64
+n_read_steps: 1
+ffn_mult: 4.0
+dropout: 0.0
+max_seq_len: 4096
+max_reasoning_iterations: 4
+lora_rank: 4
+halt_threshold: 0.5
+lambda_p: 0.5

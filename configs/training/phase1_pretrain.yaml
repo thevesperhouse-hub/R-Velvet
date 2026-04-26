@@ -1,0 +1,35 @@
+# Phase 1: Base LM pretraining (no ACR, no iterative reasoning)
+phase: phase1_pretrain
+use_acr: false
+use_iterative_reasoning: false
+optimizer: adamw           # adamw or velvet
+
+lr: 3e-4
+min_lr: 3e-5
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+
+batch_size: 32
+grad_accum_steps: 4    # effective batch = 128
+max_steps: 100000
+warmup_steps: 2000
+lr_schedule: cosine
+
+amp: bf16               # bf16 if supported, else fp16
+compile: false           # torch.compile (Linux only)
+
+# Checkpointing
+save_every: 1000
+keep_last_n: 5
+resume_from: null
+
+# Logging
+log_every: 50
+wandb: false
+wandb_project: r-velvet
+wandb_run: phase1
+
+# Debug
+debug: false             # if true: 10 steps, no save, no wandb

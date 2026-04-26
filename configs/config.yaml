@@ -1,0 +1,7 @@
+defaults:
+  - model: base
+  - training: phase1_pretrain
+  - data: text
+
+seed: 42
+output_dir: outputs/${training.phase}
