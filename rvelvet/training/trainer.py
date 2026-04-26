@@ -160,8 +160,8 @@ class Trainer:
     def train(self):
         """Main training loop."""
         tcfg = self.tcfg
-        max_steps = getattr(tcfg, 'debug_steps', 10) if tcfg.debug else tcfg.max_steps
-        log_every = max(1, max_steps // 20) if tcfg.debug else tcfg.log_every
+        max_steps = getattr(tcfg, 'debug_steps', 500) if tcfg.debug else tcfg.max_steps
+        log_every = getattr(tcfg, 'debug_log_every', 10) if tcfg.debug else tcfg.log_every
         accum_steps = tcfg.grad_accum_steps
 
         self.scheduler = self._build_scheduler(max_steps)

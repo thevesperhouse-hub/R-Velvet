@@ -34,3 +34,5 @@ wandb_project: r-velvet
 wandb_run: phase3
 
 debug: false
+debug_steps: 500
+debug_log_every: 10

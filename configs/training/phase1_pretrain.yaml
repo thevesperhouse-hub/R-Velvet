@@ -32,4 +32,6 @@ wandb_project: r-velvet
 wandb_run: phase1
 
 # Debug
-debug: false             # if true: 10 steps, no save, no wandb
+debug: false             # if true: debug_steps steps, no save, no wandb
+debug_steps: 500
+debug_log_every: 10
