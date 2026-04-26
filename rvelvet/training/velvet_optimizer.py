@@ -1,4 +1,4 @@
-"""Velvet Optimizer — AdamW + PGM + LVS v5.1.
+"""Velvet Optimizer — AdamW + PGM + LVS v5.2.
 
 Combines two adaptive mechanisms on top of AdamW:
 
@@ -7,13 +7,13 @@ Combines two adaptive mechanisms on top of AdamW:
     - Active learning zone: less momentum (faster reaction)
     - Converging zone: more momentum (stability)
 
-  LVS v5.1 (Loss-Velocity Scaling):
-    - Two slow EMAs: current vs anchor (windows scaled to run length)
-    - Current window: 3% of max_steps (50-300 steps)
-    - Anchor window: grows from 10% to 30% of max_steps over training
+  LVS v5.2 (Loss-Velocity Scaling):
+    - Two slow EMAs in LOG-SPACE: current vs anchor
+    - Log-space: constant gap as long as relative improvement rate is constant
+      (fixes signal decay where raw-loss EMAs converge as absolute loss shrinks)
+    - Windows scaled to run length (Chinchilla-inspired)
     - Current < anchor = loss improved → boost LR (floor 50%)
     - Current > anchor = loss worsening → dampen LR
-    - Ultra-stable: both EMAs heavily smoothed, no batch-noise flipping
     - Phase-adaptive range: early [0.7, 1.3], late [0.9, 1.1]
     - Plateau burst: cyclical 2x LR spike to escape local minima
 
@@ -83,7 +83,7 @@ class VelvetOptimizer(Optimizer):
         self._lvs_momentum = 0.9  # light smoothing
         # Plateau burst: cyclical LR spike to escape local minima
         self._plateau_counter = 0       # steps with |gap| < threshold
-        self._plateau_threshold = 0.003 # gap below this = plateau
+        self._plateau_threshold = 0.005 # log-space gap below this = plateau
         self._plateau_patience = 200    # steps before triggering burst
         self._burst_duration = 50       # burst lasts this many steps
         self._burst_multiplier = 2.0    # LR multiplied by this during burst
@@ -129,10 +129,9 @@ class VelvetOptimizer(Optimizer):
     def set_loss_metrics(self, loss_val: float, vocab_size: int):
         """Update both LVS (LR scaling) and PGM (momentum scaling).
 
-        LVS v5: Current EMA (~100 steps) vs Anchor EMA (~500 steps).
-        When current < anchor, loss has improved over long term → boost.
-        When current > anchor, loss is worsening → dampen.
-        Both EMAs are heavily smoothed — no batch-noise flipping.
+        LVS v5.2: EMAs computed on log(loss) instead of raw loss.
+        In log-space, exponential decay → linear decrease → constant EMA gap.
+        This prevents sig from decaying just because absolute loss values shrink.
 
         PGM: Perplexity-guided momentum — U-curve based on loss ratio.
         """
@@ -151,11 +150,16 @@ class VelvetOptimizer(Optimizer):
             pgm_scale = 0.8 + 2.0 * (0.2 - ratio)
         self._perplexity_scale = max(0.7, min(1.3, pgm_scale))
 
-        # ---- LVS v5: Dual slow-EMA crossover ----
+        # ---- LVS v5.2: Dual slow-EMA crossover in LOG-SPACE ----
+        # Log-space EMAs: constant gap as long as relative improvement is constant
+        # Raw loss 9.5→9.0 (-5.3%) and 6.5→6.3 (-3.1%) look different in linear space
+        # but in log space both produce proportional gaps → sig stays stable
+        log_loss = math.log(max(loss_val, 1e-8))
+
         # Initialize EMAs on first call
         if self._ema_current is None:
-            self._ema_current = loss_val
-            self._ema_anchor = loss_val
+            self._ema_current = log_loss
+            self._ema_anchor = log_loss
             self._entropy_scale = 1.0
             self._lvs_confidence = 0.0
             return
@@ -165,20 +169,20 @@ class VelvetOptimizer(Optimizer):
         anchor_window = self._anchor_window_min + (self._anchor_window_max - self._anchor_window_min) * progress
         self._ema_anchor_alpha = 2.0 / (anchor_window + 1)
 
-        # Update both EMAs
-        self._ema_current += self._ema_current_alpha * (loss_val - self._ema_current)
-        self._ema_anchor += self._ema_anchor_alpha * (loss_val - self._ema_anchor)
+        # Update both EMAs in log-space
+        self._ema_current += self._ema_current_alpha * (log_loss - self._ema_current)
+        self._ema_anchor += self._ema_anchor_alpha * (log_loss - self._ema_anchor)
 
-        # Gap: normalized difference between current and anchor
+        # Gap: difference in log-space (= log ratio of smoothed losses)
         # Negative = current < anchor = loss has improved → boost
         # Positive = current > anchor = loss worsening → dampen
-        if self._ema_anchor < 1e-8:
-            return
-
-        gap = (self._ema_current - self._ema_anchor) / self._ema_anchor
+        gap = self._ema_current - self._ema_anchor
         gap = max(-1.0, min(1.0, gap))
 
-        # Signal strength for logging (absolute gap, scaled)
+        # Signal strength for logging (absolute gap in log-space, scaled)
+        # |gap|=0.01 → 1% relative improvement → sig=0.10
+        # |gap|=0.05 → 5% relative improvement → sig=0.50
+        # |gap|=0.10+ → 10%+ relative improvement → sig=1.00
         self._lvs_confidence = min(1.0, abs(gap) * 10.0)
 
         # Phase-adaptive range: early=wide [0.7, 1.3], late=narrow [0.9, 1.1]
@@ -186,19 +190,19 @@ class VelvetOptimizer(Optimizer):
         max_boost = 1.3 - 0.2 * phase
         max_damp = 0.7 + 0.2 * phase
 
-        # Map gap to scale:
-        #   gap < 0 (improving)  → boost, floor at 50% of max boost
-        #   gap > 0 (worsening)  → dampen proportionally
-        #   gap ≈ 0 (converged)  → neutral
-        if gap < -0.001:
+        # Map gap to scale (thresholds calibrated for log-space):
+        #   gap < -0.005 (improving ≥0.5%)  → boost, floor at 50%
+        #   gap > +0.005 (worsening ≥0.5%)  → dampen proportionally
+        #   |gap| < 0.005 (stable)           → neutral
+        if gap < -0.005:
             # Improving: proportional + floor guarantee
-            # 1% improvement → strength 0.5 (floor), 10%+ → strength 1.0 (max)
-            strength = min(1.0, abs(gap) * 5.0)
+            # 0.5% → strength 0.5 (floor), 5%+ → strength 1.0 (max)
+            strength = min(1.0, abs(gap) / 0.05)
             strength = max(0.5, strength)  # FLOOR: at least 50% of max boost
             raw_scale = 1.0 + (max_boost - 1.0) * strength
-        elif gap > 0.001:
+        elif gap > 0.005:
             # Worsening: proportional damping
-            strength = min(1.0, gap * 5.0)
+            strength = min(1.0, gap / 0.05)
             raw_scale = 1.0 - (1.0 - max_damp) * strength
         else:
             raw_scale = 1.0
