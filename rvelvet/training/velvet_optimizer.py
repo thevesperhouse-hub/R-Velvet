@@ -152,15 +152,22 @@ class VelvetOptimizer(Optimizer):
         max_damp = 0.7 + 0.2 * phase
 
         # Map gap to raw scale:
-        #   gap < 0 (improving)  → boost: scale between 1.0 and max_boost
-        #   gap > 0 (worsening)  → dampen: scale between max_damp and 1.0
-        #   gap = 0 (flat)       → neutral: 1.0
-        if gap <= 0:
-            # Improving: stronger improvement → more boost
-            raw_scale = 1.0 + (max_boost - 1.0) * min(1.0, abs(gap) * 10.0)
+        #   gap < -deadzone (improving)  → boost with floor guarantee
+        #   gap > +deadzone (worsening)  → dampen proportionally
+        #   |gap| < deadzone (flat)      → neutral: 1.0
+        deadzone = 0.001  # 0.1% gap = flat
+        if gap < -deadzone:
+            # Improving: scale proportional to gap, but with a FLOOR
+            # Even a tiny improvement gets at least 30% of max boost
+            strength = min(1.0, abs(gap) * 10.0)
+            strength = max(0.3, strength)  # floor: always at least 30% boost
+            raw_scale = 1.0 + (max_boost - 1.0) * strength
+        elif gap > deadzone:
+            # Worsening: proportional damping, no floor needed
+            strength = min(1.0, gap * 10.0)
+            raw_scale = 1.0 - (1.0 - max_damp) * strength
         else:
-            # Worsening: stronger worsening → more damping
-            raw_scale = 1.0 - (1.0 - max_damp) * min(1.0, gap * 10.0)
+            raw_scale = 1.0
 
         # Momentum: smooth transitions
         self._entropy_scale = self._lvs_momentum * self._entropy_scale + (1.0 - self._lvs_momentum) * raw_scale
