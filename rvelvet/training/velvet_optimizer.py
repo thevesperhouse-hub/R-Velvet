@@ -73,6 +73,8 @@ class VelvetOptimizer(Optimizer):
         # Stall detection: EMA baseline for plateau damping
         self._loss_ema = None
         self._loss_ema_alpha = 0.02  # slow-moving baseline
+        # LVS momentum: smooth scale transitions instead of snapping to neutral
+        self._lvs_momentum = 0.9  # decay factor (0.9 = ~50 steps to fully decay)
         # PGM state: perplexity-guided momentum (for beta1)
         self._perplexity_scale = 1.0
         self._last_grad_norm = 0.0
@@ -178,8 +180,13 @@ class VelvetOptimizer(Optimizer):
         else:
             raw_scale = max_boost - (max_boost - max_damp) * norm_slope
 
-        # Blend with confidence: low R² → scale stays near 1.0
-        self._entropy_scale = 1.0 + r_squared * (raw_scale - 1.0)
+        # Blend with confidence: low R² → new_scale near 1.0
+        new_scale = 1.0 + r_squared * (raw_scale - 1.0)
+
+        # Momentum: smooth transitions — don't snap to neutral when R² drops
+        # If R² was high (boosting at 1.2) and drops to 0, scale decays:
+        #   step 1: 1.18, step 10: 1.12, step 20: 1.06, step 50: ~1.01
+        self._entropy_scale = self._lvs_momentum * self._entropy_scale + (1.0 - self._lvs_momentum) * new_scale
 
         # ---- Stall damping: when loss stops improving, dampen to settle ----
         # EMA tracks a slow-moving loss baseline
