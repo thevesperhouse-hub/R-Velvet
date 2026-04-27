@@ -104,7 +104,7 @@ AdamW with two adaptive mechanisms that adjust to training dynamics:
 
 Log-space is critical. In linear space, as loss decreases (e.g., 8.0 → 4.0), the absolute gap between EMAs shrinks even if the relative improvement rate stays constant. This caused the signal to decay after ~300 steps. In log-space, a constant improvement rate produces a constant EMA gap.
 
-EMA windows scale with total training steps (Chinchilla-inspired). Current window is 2% of max_steps, anchor starts at 10% and grows to 25%. For a 12K step run, current=150, anchor grows from 1200→3000. This keeps the signal stable across different run lengths.
+EMA windows scale with total training steps (Chinchilla-inspired). Current window is 2% of max_steps, anchor starts at 10% and grows to 25%. For a 16K step run, current=150, anchor grows from 1200→4000. This keeps the signal stable across different run lengths.
 
 Asymmetric momentum: when the signal says "boost", LR ramps up fast (momentum 0.8). When the signal says "reduce", LR decays slowly (momentum 0.995, half-life ~140 steps). This holds the boost longer.
 
@@ -121,7 +121,7 @@ optimizer = VelvetOptimizer(
     perplexity_guided=True,     # enable PGM
 )
 
-optimizer.set_training_steps(max_steps=12000)
+optimizer.set_training_steps(max_steps=16000)
 
 for step in range(max_steps):
     loss = model(batch)
@@ -140,7 +140,7 @@ for step in range(max_steps):
 
 To use AdamW instead, set `training.optimizer=adamw` in configs.
 
-### Velvet vs AdamW on 50M params, 12K steps
+### Velvet vs AdamW on 50M params, 16K steps
 
 ![Comparison](assets/comparison.png)
 
