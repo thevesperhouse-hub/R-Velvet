@@ -38,23 +38,17 @@ def main():
     print(f"  Vocab size: {args.vocab_size:,}")
     print(f"  Max lines:  {args.max_lines or 'all'}")
 
-    # --- Build tokenizer ---
     tokenizer = Tokenizer(models.BPE())
 
-    # Normalizer: unicode NFC + lowercase accents preserved
     tokenizer.normalizer = normalizers.Sequence([
         normalizers.NFC(),
         normalizers.Replace("``", '"'),
         normalizers.Replace("''", '"'),
     ])
 
-    # Pre-tokenizer: split on whitespace + punctuation (like GPT-2 style)
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-
-    # Decoder
     tokenizer.decoder = decoders.ByteLevel()
 
-    # --- Trainer ---
     special_tokens = ["<|endoftext|>", "<|padding|>", "<|unknown|>"]
 
     trainer = trainers.BpeTrainer(
@@ -65,8 +59,6 @@ def main():
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
 
-    # --- Prepare input ---
-    # If max_lines set, create a temporary subset
     input_files = [args.input]
 
     if args.max_lines:
@@ -81,7 +73,6 @@ def main():
         input_files = [subset_path]
         print(f"  Subset saved: {subset_path}")
 
-    # --- Train ---
     print(f"\nTraining...")
     t0 = time.time()
     tokenizer.train(input_files, trainer)
@@ -89,18 +80,15 @@ def main():
     print(f"  Done in {elapsed:.1f}s")
     print(f"  Vocab size: {tokenizer.get_vocab_size():,}")
 
-    # --- Post-processing: add end-of-text token ---
     eos_id = tokenizer.token_to_id("<|endoftext|>")
     tokenizer.post_processor = TemplateProcessing(
         single="$A <|endoftext|>",
         special_tokens=[("<|endoftext|>", eos_id)],
     )
 
-    # --- Save as HuggingFace-compatible ---
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Wrap in PreTrainedTokenizerFast for full HF compatibility
     hf_tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
         eos_token="<|endoftext|>",
@@ -109,11 +97,9 @@ def main():
     )
     hf_tokenizer.save_pretrained(str(output_dir))
 
-    # --- Verify ---
     print(f"\nSaved to: {output_dir}")
     print(f"  Files: {[f.name for f in output_dir.iterdir()]}")
 
-    # Quick test
     test_sentences = [
         "Bonjour, comment allez-vous aujourd'hui ?",
         "Le développement de l'intelligence artificielle progresse rapidement.",
@@ -139,7 +125,6 @@ def main():
         print(f"\n  WARNING: vocab_size {args.vocab_size} > 65535. tokenize_data.py uses uint16!")
         print(f"  Either reduce vocab_size or switch to uint32.")
 
-    # Cleanup subset if created
     if args.max_lines:
         Path(args.input + ".subset").unlink(missing_ok=True)
 

@@ -1,10 +1,5 @@
-"""
-Loss computation per training phase.
-
-Phase 1: Cross-entropy only
-Phase 2: CE + ACR auxiliary losses (load_balance, entropy, compute_cost)
-Phase 3: CE + halting loss + deep supervision
-"""
+"""Loss computation per training phase. Phase 1: CE only. Phase 2: CE + ACR auxiliary losses.
+Phase 3: CE + halting loss + deep supervision."""
 
 import torch
 import torch.nn.functional as F
@@ -21,24 +16,9 @@ def compute_phase_loss(
     cfg,
     model=None,
 ) -> tuple:
-    """
-    Compute total loss and individual components for a given training phase.
-
-    Args:
-        model_output: dict from model.forward()
-        targets: (B, L) target token IDs
-        phase: one of 'phase1_pretrain', 'phase2_acr', 'phase3_iterative'
-        vocab_size: vocabulary size for CE
-        cfg: training config (OmegaConf or similar) with loss weights
-        model: the RVelvet model (needed for Phase 3 deep supervision)
-
-    Returns:
-        (total_loss, loss_dict) where loss_dict has all individual loss terms
-    """
-    logits = model_output['logits']  # (B, L, V)
+    """Compute total loss and components for the given phase."""
+    logits = model_output['logits']
     B, L, V = logits.shape
-
-    # --- Cross-entropy (all phases) ---
     ce_loss = F.cross_entropy(
         logits.reshape(B * L, V),
         targets.reshape(B * L),
@@ -47,7 +27,6 @@ def compute_phase_loss(
     loss_dict = {'ce': ce_loss}
     total_loss = ce_loss
 
-    # --- Phase 2: ACR losses ---
     if phase == 'phase2_acr':
         acr_losses = compute_acr_losses(
             model_output['route_weights'],
@@ -62,9 +41,7 @@ def compute_phase_loss(
         loss_dict['entropy'] = acr_losses['entropy']
         loss_dict['compute_cost'] = acr_losses['compute_cost']
 
-    # --- Phase 3: Halting + Deep supervision ---
     elif phase == 'phase3_iterative':
-        # Halting loss
         halting_loss = compute_halting_loss(
             model_output['p_halts'],
             lambda_p=getattr(cfg, 'lambda_p', 0.5),
@@ -72,7 +49,6 @@ def compute_phase_loss(
         total_loss = total_loss + cfg.lambda_halting * halting_loss
         loss_dict['halting'] = halting_loss
 
-        # Deep supervision: CE on each iteration's output
         if model is not None and 'iteration_outputs' in model_output:
             local_out = model_output.get('local_out')
             iter_outputs = model_output['iteration_outputs']
@@ -95,20 +71,8 @@ def _compute_deep_supervision(
     targets: torch.Tensor,
     vocab_size: int,
 ) -> torch.Tensor:
-    """
-    Deep supervision: expand each iteration's concepts back to token-level,
-    project through lm_head, compute CE.
-
-    Args:
-        model: RVelvet model (needs .expansion, .out_norm, .lm_head)
-        iter_outputs: list of (B, N, D) concept tensors per iteration
-        local_out: (B, L, D) local encoder output
-        targets: (B, L) target token IDs
-        vocab_size: vocabulary size
-
-    Returns:
-        mean CE loss across iterations
-    """
+    """Deep supervision: expand each iteration's concepts to token-level, project through lm_head,
+    compute CE, and return mean across iterations."""
     B, L = targets.shape
     losses = []
 

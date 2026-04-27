@@ -64,13 +64,11 @@ def load_yaml(path: str) -> dict:
 
 
 def _coerce_numerics(obj):
-    """Recursively ensure numeric strings are converted to int/float."""
     if isinstance(obj, dict):
         return {k: _coerce_numerics(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_coerce_numerics(v) for v in obj]
     if isinstance(obj, str):
-        # Try int first, then float
         try:
             return int(obj)
         except ValueError:
@@ -106,16 +104,13 @@ def apply_overrides(cfg: Config, overrides: list):
         key, val = override.split('=', 1)
         parts = key.split('.')
 
-        # Navigate to parent
         obj = cfg
         for part in parts[:-1]:
             obj = obj[part]
 
-        # Parse value
         final_key = parts[-1]
         old_val = obj.get(final_key)
         if old_val is not None:
-            # Match type of existing value
             if isinstance(old_val, bool):
                 val = val.lower() in ('true', '1', 'yes')
             elif isinstance(old_val, int):
@@ -123,7 +118,6 @@ def apply_overrides(cfg: Config, overrides: list):
             elif isinstance(old_val, float):
                 val = float(val)
         else:
-            # Try auto-parse
             try:
                 val = int(val)
             except ValueError:
@@ -182,17 +176,14 @@ def main():
                         help="Override config values: key=value")
     args = parser.parse_args()
 
-    # Load config
     cfg = load_config(args.phase, args.model)
 
-    # CLI overrides
     if args.resume:
         cfg.training.resume_from = args.resume
     if args.debug:
         cfg.training.debug = True
     apply_overrides(cfg, args.set)
 
-    # Print config
     print("=" * 60)
     print(f"  R-VELVET TRAINING — {args.phase}")
     print("=" * 60)
@@ -202,19 +193,16 @@ def main():
     print(f"Resume:   {cfg.training.get('resume_from', None)}")
     print()
 
-    # Seed
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(cfg.seed)
 
-    # Build model
     model = build_model(cfg)
     counts = model.count_parameters()
     print(f"Model: {cfg.model.name}")
     for name, count in counts.items():
         print(f"  {name:25s}: {count:>10,}")
 
-    # Load checkpoint
     resume = cfg.training.get('resume_from', None)
     if resume:
         print(f"\nLoading checkpoint: {resume}")
@@ -225,7 +213,6 @@ def main():
         if unexpected:
             print(f"  Unexpected keys: {len(unexpected)}")
 
-    # Dataset
     if cfg.training.debug:
         debug_path = Path("data/_debug.bin")
         debug_path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,7 +228,6 @@ def main():
         )
         print(f"\nDataset: {cfg.data.train_path} ({len(dataset)} samples)")
 
-    # Train
     trainer = Trainer(model, dataset, cfg)
     trainer.train()
 

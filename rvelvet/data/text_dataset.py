@@ -28,11 +28,9 @@ class TextDataset(Dataset):
         self.seq_len = seq_len
         self.stride = stride or seq_len
 
-        # memmap: zero RAM, reads from disk on access
         self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
         self.n_tokens = len(self.data)
 
-        # We need seq_len + 1 tokens per sample (for the shifted target)
         if self.n_tokens < seq_len + 1:
             raise ValueError(
                 f"Data file has {self.n_tokens} tokens, need at least {seq_len + 1}"
@@ -47,7 +45,6 @@ class TextDataset(Dataset):
         start = idx * self.stride
         end = start + self.seq_len + 1
 
-        # Clamp to valid range
         if end > self.n_tokens:
             start = self.n_tokens - self.seq_len - 1
             end = self.n_tokens

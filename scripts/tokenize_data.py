@@ -52,7 +52,6 @@ def main():
             "Use a smaller tokenizer or switch to uint32."
         )
 
-    # Count lines (without loading all into memory)
     print(f"Counting lines in {args.input}...")
     n_lines = 0
     with open(args.input, 'r', encoding='utf-8') as f:
@@ -60,7 +59,6 @@ def main():
             n_lines += 1
     print(f"  {n_lines:,} lines")
 
-    # Tokenize in streaming chunks, write incrementally
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     total_tokens = 0
 
@@ -79,7 +77,6 @@ def main():
                 total_tokens += len(ids)
                 chunk_lines = []
 
-        # Remaining
         if chunk_lines:
             text = "".join(chunk_lines)
             ids = tokenizer.encode(text)

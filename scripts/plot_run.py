@@ -48,7 +48,6 @@ def plot_single(data: dict, title: str, output_path: str):
 
     steps = data['step']
 
-    # Loss
     ax = axes[0, 0]
     ax.plot(steps, data['loss'], 'b-', linewidth=0.8)
     ax.set_xlabel('Step')
@@ -56,7 +55,6 @@ def plot_single(data: dict, title: str, output_path: str):
     ax.set_title('Training Loss')
     ax.grid(True, alpha=0.3)
 
-    # Perplexity
     ax = axes[0, 1]
     if 'ppl' in data:
         ax.plot(steps, data['ppl'], 'b-', linewidth=0.8)
@@ -66,7 +64,6 @@ def plot_single(data: dict, title: str, output_path: str):
     ax.set_title('Perplexity (log scale)')
     ax.grid(True, alpha=0.3)
 
-    # LR
     ax = axes[1, 0]
     ax.plot(steps, data['lr'], 'r-', linewidth=0.8)
     ax.set_xlabel('Step')
@@ -74,7 +71,6 @@ def plot_single(data: dict, title: str, output_path: str):
     ax.set_title('Effective LR')
     ax.grid(True, alpha=0.3)
 
-    # Grad norm (or empty for AdamW)
     ax = axes[1, 1]
     if has_velvet and 'grad_norm' in data:
         ax.plot(steps, data['grad_norm'], 'orange', linewidth=0.8)
@@ -84,7 +80,6 @@ def plot_single(data: dict, title: str, output_path: str):
     ax.grid(True, alpha=0.3)
 
     if has_velvet:
-        # Beta1 (PGM)
         ax = axes[2, 0]
         ax.plot(steps, data['beta1'], 'g-', linewidth=0.8)
         ax.set_xlabel('Step')
@@ -92,7 +87,6 @@ def plot_single(data: dict, title: str, output_path: str):
         ax.set_title('PGM: Effective Beta1')
         ax.grid(True, alpha=0.3)
 
-        # LVS scale
         ax = axes[2, 1]
         ax.plot(steps, data['lvs_scale'], 'm-', linewidth=0.8)
         ax.axhline(y=1.0, color='k', linestyle='--', alpha=0.3)
@@ -101,7 +95,6 @@ def plot_single(data: dict, title: str, output_path: str):
         ax.set_title('LVS: LR Scale Factor')
         ax.grid(True, alpha=0.3)
 
-        # Signal strength
         ax = axes[3, 0]
         if 'signal' in data:
             ax.plot(steps, data['signal'], 'c-', linewidth=0.8)
@@ -112,7 +105,6 @@ def plot_single(data: dict, title: str, output_path: str):
         ax.set_title('LVS: Signal Strength (EMA gap)')
         ax.grid(True, alpha=0.3)
 
-        # LVS phase
         ax = axes[3, 1]
         if 'lvs_phase' in data:
             ax.plot(steps, data['lvs_phase'], 'k-', linewidth=0.8)
@@ -134,7 +126,6 @@ def plot_compare(datasets: list, labels: list, output_path: str):
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # Loss comparison
     ax = axes[0]
     for i, (data, label) in enumerate(zip(datasets, labels)):
         color = colors[i % len(colors)]
@@ -145,7 +136,6 @@ def plot_compare(datasets: list, labels: list, output_path: str):
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # LR comparison
     ax = axes[1]
     for i, (data, label) in enumerate(zip(datasets, labels)):
         color = colors[i % len(colors)]
