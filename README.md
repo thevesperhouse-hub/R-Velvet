@@ -1,8 +1,26 @@
 # R-Velvet
 
-Multi-scale transformer for unlimited context. Processes 1M+ tokens by compressing intelligently, reasoning globally, and remembering selectively.
+![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg)
+![CUDA](https://img.shields.io/badge/CUDA-12.1+-76B900.svg)
+![Triton](https://img.shields.io/badge/Triton-3.0+-blueviolet.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-## Architecture Overview
+Multi-scale transformer that handles 1M+ token contexts by compressing intelligently, reasoning globally, and remembering selectively. Instead of brute-forcing quadratic attention, R-Velvet processes local windows cheaply, compresses them into abstract "concepts", and runs full attention only over these concepts. The result is ~3800x cheaper than full quadratic for million-token sequences.
+
+Comes with **VelvetOptimizer**, a custom optimizer that beats AdamW by adapting momentum (PGM) and learning rate (LVS) based on training dynamics. Converges faster and maintains the advantage through late training.
+
+## What makes this different
+
+Most long-context models either use sparse attention (which breaks global reasoning) or hierarchical processing (which loses fine-grained information). R-Velvet does both without the tradeoffs:
+
+**Local-to-global pipeline:** Windowed attention captures syntax and local semantics (cheap, parallelizable). Cross-attention compressor learns to extract the important bits into a small set of concept vectors. Global reasoner runs full attention over concepts, enabling true long-range reasoning like "paragraph 3 contradicts paragraph 47". Finally, concepts get expanded back to token-level for next-token prediction.
+
+**Adaptive computation routing (ACR):** Not all text segments need the same compute. News articles need deep processing, filler text can be skimmed. ACR routes each segment to SKIM (10% cost), PROCESS (50% cost), or FOCUS (100% cost) based on learned heuristics. Target distribution is 60/30/10, reducing average compute by ~65%.
+
+**Iterative reasoning:** For hard prompts, the model can loop through the global reasoner multiple times with per-iteration LoRA adapters. Each pass refines the concepts further. A PonderNet-style halting unit learns when to stop (between 1-8 iterations). Adds minimal overhead (1.6% params) but enables multi-step reasoning chains.
+
+## Architecture
 
 ```
 tokens (1M+)
@@ -43,246 +61,52 @@ tokens (1M+)
 └──────────────────┘
 ```
 
-**Complexity story**: 1M tokens with window=512, 1 concept/segment:
-- Local attention: `1M × 512² = 262B ops` (parallelizable per window)
-- Global attention: `2000² = 4M ops` (trivial)
-- Full quadratic would be: `1T ops` — R-Velvet is **~3800x cheaper**
-
-## Components
-
-| Module | Path | Description |
-|---|---|---|
-| `RVelvet` | `rvelvet/model.py` | Top-level model, orchestrates all stages |
-| `LocalEncoder` | `rvelvet/layers/local_attention.py` | Windowed self-attention stack |
-| `SegmentCompressor` | `rvelvet/layers/segment_compressor.py` | Cross-attention compression (tokens → concepts) |
-| `GlobalReasoner` | `rvelvet/layers/global_reasoner.py` | Full attention over concepts |
-| `MemoryController` | `rvelvet/layers/memory_controller.py` | Semantic read/write external memory |
-| `ExpansionLayer` | `rvelvet/model.py` | Cross-attention expansion (concepts → tokens) |
-| `SegmentScanner` | `rvelvet/layers/adaptive_router.py` | ACR: lightweight segment scanner |
-| `AdaptiveRouter` | `rvelvet/layers/adaptive_router.py` | ACR: Gumbel-softmax routing |
-| `AdaptiveSegmentCompressor` | `rvelvet/layers/segment_compressor.py` | ACR: variable-rate compression |
-| `IterativeReasoner` | `rvelvet/layers/iterative_reasoner.py` | Multi-pass reasoning with LoRA + halting |
-| `IterationLoRABank` | `rvelvet/layers/lora_adapter.py` | Per-iteration LoRA adapters |
-| `HaltingUnit` | `rvelvet/layers/halting.py` | PonderNet-style halting prediction |
-
-## Optional Modes
-
-### ACR (Adaptive Computation Routing) — `use_acr=True`
-
-Routes each segment to one of three computation paths:
-
-| Route | Local Layers | Global Layers | Concepts/Segment | Cost |
-|---|---|---|---|---|
-| **SKIM** | 2 | 2 | 1 | 10% |
-| **PROCESS** | 4 | 6 | 4 | 50% |
-| **FOCUS** | 6 | 8 | 16 | 100% |
-
-Target distribution: 60% SKIM, 30% PROCESS, 10% FOCUS. Training uses Gumbel-softmax with temperature annealing; inference uses hard argmax. Overhead: ~0.7% params (scanner).
-
-### Iterative Reasoning — `use_iterative_reasoning=True`
-
-Multi-pass reasoning through the global reasoner with:
-- **Shared weights**: no duplication of the global reasoner
-- **Per-iteration LoRA**: different behavior each pass (~786K params)
-- **PonderNet halting**: learned early exit at inference
-- **COCONUT**: output of iteration i → input of iteration i+1
-
-Overhead: ~826K params (1.6% of a 50M model).
-
-## Model Sizes
-
-| Config | d_model | Local | Global | Heads | ~Params (base) | ~Params (+ACR+Iter) |
-|---|---|---|---|---|---|---|
-| `small` | 256 | 4 layers | 4 layers | 4/4 | ~5M | ~6M |
-| `base` | 384 | 6 layers | 8 layers | 6/8 | ~50M | ~52M |
-
-## Installation
+## Quick start
 
 ```bash
+# Clone and install
+git clone https://github.com/thevesperhouse-hub/R-Velvet.git
 cd R-Velvet
-python -m venv venv
-venv\Scripts\activate        # Windows
-# source venv/bin/activate   # Linux/Mac
-
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-```
 
-## Quick Start
+# Get data (using our CulturaX subset)
+pip install huggingface_hub
+huggingface-cli login --token YOUR_HF_TOKEN
+huggingface-cli download AkiraXan/R-Velvet_CulturaX_sub train.bin --local-dir data/ --repo-type dataset
 
-### 1. Tokenize data
-
-```bash
-python scripts/tokenize_data.py \
-    --input corpus.txt \
-    --output data/train.bin \
-    --tokenizer gpt2
-```
-
-### 2. Phase 1 — Base pretraining
-
-```bash
+# Train base model
 python scripts/train.py training=phase1_pretrain model=base data=text
 ```
 
-### 3. Phase 2 — ACR finetuning
+Or train your own tokenizer and use custom data:
 
 ```bash
-python scripts/train.py \
-    training=phase2_acr model=base data=text \
-    training.resume_from=outputs/phase1_pretrain/ckpt_final.pt
+# Train BPE tokenizer (vocab size 32K)
+python scripts/train_tokenizer.py --input corpus.txt --output data/velvet_tok
+
+# Tokenize your corpus
+python scripts/tokenize_data.py --input corpus.txt --output data/train.bin --tokenizer data/velvet_tok
+
+# Train
+python scripts/train.py training=phase1_pretrain model=base data=text
 ```
 
-### 4. Phase 3 — Iterative reasoning
-
-```bash
-python scripts/train.py \
-    training=phase3_iterative model=base data=text \
-    training.resume_from=outputs/phase2_acr/ckpt_final.pt
-```
-
-### Debug mode (any phase)
-
-```bash
-python scripts/train.py training=phase1_pretrain model=small training.debug=true
-```
-
-Runs 10 steps on synthetic data. No checkpoint, no wandb.
-
-## Configuration
-
-Hydra configs in `configs/`:
-
-```
-configs/
-├── config.yaml                  # Entry point (defaults)
-├── model/
-│   ├── small.yaml               # ~5M params (debug)
-│   └── base.yaml                # ~50M params
-├── training/
-│   ├── phase1_pretrain.yaml     # LR=3e-4, 100K steps
-│   ├── phase2_acr.yaml          # LR=1e-4, 50K steps
-│   └── phase3_iterative.yaml   # LR=5e-4, 30K steps
-└── data/
-    └── text.yaml                # Dataset paths, seq_len
-```
-
-Override any value from CLI:
-
-```bash
-# Change learning rate and batch size
-python scripts/train.py training=phase1_pretrain training.lr=1e-4 training.batch_size=16
-
-# Use small model
-python scripts/train.py training=phase1_pretrain model=small
-
-# Enable wandb
-python scripts/train.py training=phase1_pretrain training.wandb=true
-```
-
-## Training Phases
-
-### Phase 1 — Base Pretraining
-
-Standard language model pretraining. All parameters trained with cross-entropy loss.
-
-| Param | Value |
-|---|---|
-| Mode | `use_acr=false`, `use_iterative_reasoning=false` |
-| LR | 3e-4 (cosine decay, 2K warmup) |
-| Effective batch | 128 (32 x 4 accum) |
-| Steps | 100K |
-| Loss | Cross-entropy |
-
-### Phase 2 — ACR Finetuning
-
-Enable adaptive computation routing. Loads Phase 1 checkpoint with `strict=False` (new scanner/router/compressor modules).
-
-| Param | Value |
-|---|---|
-| Mode | `use_acr=true`, `use_iterative_reasoning=false` |
-| LR | 1e-4 (base params at x0.1, ACR params at full) |
-| Effective batch | 128 (16 x 8 accum) |
-| Steps | 50K |
-| Loss | CE + 0.01\*load_balance + 0.001\*entropy + 0.005\*compute_cost |
-
-### Phase 3 — Iterative Reasoning
-
-Enable multi-pass reasoning. Freezes all base parameters, only trains LoRA bank + halting unit + iteration embeddings.
-
-| Param | Value |
-|---|---|
-| Mode | `use_acr=true`, `use_iterative_reasoning=true` |
-| LR | 5e-4 (only unfrozen params) |
-| Effective batch | 128 (16 x 8 accum) |
-| Steps | 30K |
-| Loss | CE + 0.1\*halting + 0.1\*deep_supervision |
-
-Deep supervision: each iteration's concepts are expanded → lm_head → CE, averaged across iterations.
+Training happens in three phases. Phase 1 pretrains the base model, Phase 2 enables ACR, Phase 3 adds iterative reasoning. Each phase resumes from the previous checkpoint with `training.resume_from=path/to/ckpt.pt`.
 
 ## VelvetOptimizer
 
-Custom optimizer built on AdamW with two adaptive mechanisms: **PGM** (Perplexity-Guided Momentum) and **LVS** (Loss-Velocity Scaling). Converges faster than AdamW and maintains advantage through late training.
+AdamW with two adaptive mechanisms that adjust to training dynamics:
 
-`rvelvet/training/velvet_optimizer.py`
+**PGM (Perplexity-Guided Momentum)** adapts beta1 based on where the model is in training. Early on when the model is random, momentum stays normal. During active learning (mid-training), momentum drops to react faster to gradients. Near convergence, momentum increases for stability. Uses a simple U-curve based on loss/max_entropy ratio. Zero overhead.
 
-### PGM — Perplexity-Guided Momentum
+**LVS (Loss-Velocity Scaling)** boosts the learning rate when loss is actively dropping, reduces it when loss stagnates or worsens. Tracks two EMAs of log(loss): a fast "current" EMA and a slow "anchor" EMA. When current < anchor, the model is improving → boost LR. When current > anchor, the model is worsening → reduce LR.
 
-Adapts beta1 dynamically based on normalized loss ratio (loss / max_entropy). Uses a U-curve mapping:
+Log-space is critical. In linear space, as loss decreases (e.g., 8.0 → 4.0), the absolute gap between EMAs shrinks even if the relative improvement rate stays constant. This caused the signal to decay after ~300 steps. In log-space, a constant improvement rate produces a constant EMA gap.
 
-| Training Zone | Loss Ratio | beta1 Effect |
-|---|---|---|
-| Random (high loss) | > 0.6 | beta1 x 1.0 (normal momentum) |
-| Active learning | 0.2 — 0.6 | beta1 x 0.8-1.0 (less momentum, faster reaction) |
-| Converging (low loss) | < 0.2 | beta1 x 0.8-1.1 (more momentum, stability) |
+EMA windows scale with total training steps (Chinchilla-inspired). Current window is 2% of max_steps, anchor starts at 10% and grows to 25%. For a 12K step run, current=150, anchor grows from 1200→3000. This keeps the signal stable across different run lengths.
 
-Clamped to [0.7, 1.3] range. Zero overhead — pure scalar math.
-
-### LVS v5.2 — Loss-Velocity Scaling
-
-Scales the learning rate based on whether the model is actively improving. Uses dual-EMA crossover in **log-space** with adaptive windows and asymmetric momentum.
-
-**Core mechanism:**
-1. Two EMAs track `log(loss)` — a fast "current" EMA and a slow "anchor" EMA
-2. If current < anchor (loss improving) → **full LR boost** (max_boost)
-3. If current > anchor (loss worsening) → proportional LR dampening
-4. If current ≈ anchor (plateau) → neutral (1.0)
-
-**Why log-space?** In linear space, as absolute loss decreases, percentage changes naturally shrink even if relative improvement rate is constant. This caused the signal to decay after ~300 steps. In log-space, exponential decay becomes linear → constant EMA gap → stable signal.
-
-**Adaptive EMA windows (Chinchilla-inspired):** Windows scale with total training steps instead of being hardcoded:
-- Current EMA: 3% of max_steps (clamped 50-300)
-- Anchor EMA: starts at 10%, grows to 30% over training (clamped 100-500)
-
-| Run Length | Current Window | Anchor Window |
-|---|---|---|
-| 500 steps (debug) | 50 | 100 → 200 |
-| 3,500 steps (bench) | 105 | 300 → 500 |
-| 100K steps (prod) | 300 | 300 → 500 |
-
-**Asymmetric momentum:** LVS ramps up fast (momentum 0.8, ~5 steps) but decays slowly (momentum 0.995, half-life ~140 steps). This holds the LR boost much longer after peak signal.
-
-**Binary boost:** When the model is improving at all (gap < -0.005 in log-space), LVS applies the full phase-adaptive max_boost — no proportional decay. This prevents the boost from eroding as improvement rate naturally slows.
-
-**Phase-adaptive range:**
-
-| Phase | Boost Range | Dampen Range |
-|---|---|---|
-| Early (step 0) | up to 1.3x | down to 0.7x |
-| Late (final step) | up to 1.1x | down to 0.9x |
-
-**Plateau burst:** If the EMA gap stays below 0.5% for 200 consecutive steps (after warmup), triggers a cosine-shaped LR spike (2x for 50 steps) to escape local minima.
-
-### Kernel Backends
-
-Three backends, auto-detected by priority:
-
-| Backend | Requirement | Speed |
-|---|---|---|
-| Triton | `triton` package + CUDA GPU | Fastest (fused kernel) |
-| CUDA | CUDA GPU + cpp_extension | ~80% of Triton |
-| PyTorch | CPU or no GPU extensions | Baseline |
-
-### Usage
+Asymmetric momentum: when the signal says "boost", LR ramps up fast (momentum 0.8). When the signal says "reduce", LR decays slowly (momentum 0.995, half-life ~140 steps). This holds the boost longer.
 
 ```python
 from rvelvet.training.velvet_optimizer import VelvetOptimizer
@@ -297,8 +121,7 @@ optimizer = VelvetOptimizer(
     perplexity_guided=True,     # enable PGM
 )
 
-# Tell LVS the total run length (required for adaptive windows)
-optimizer.set_training_steps(max_steps=100000)
+optimizer.set_training_steps(max_steps=12000)
 
 for step in range(max_steps):
     loss = model(batch)
@@ -307,83 +130,110 @@ for step in range(max_steps):
     optimizer.step()
     optimizer.zero_grad()
 
-    # Feed loss to LVS + PGM (after optimizer.step)
-    optimizer.set_loss_metrics(loss.item(), vocab_size=50257)
+    optimizer.set_loss_metrics(loss.item(), vocab_size=32000)
 
-    # Logging
+    # Monitor adaptive mechanisms
     print(f"lr={optimizer.effective_lr:.2e} "
           f"beta1={optimizer.effective_beta1:.3f} "
-          f"lvs={optimizer.lr_scale:.3f} "
-          f"sig={optimizer.lvs_confidence:.2f}")
+          f"lvs={optimizer.lr_scale:.3f}")
 ```
 
-To use AdamW instead, set `optimizer: adamw` in the training config.
+To use AdamW instead, set `training.optimizer=adamw` in configs.
 
-### Plotting Training Runs
+### Velvet vs AdamW on 50M params, 12K steps
+
+![Comparison](assets/comparison.png)
+
+Velvet converges faster and maintains a consistent advantage throughout training. Final loss: **3.69** (Velvet) vs **3.72** (AdamW). The LR plot shows Velvet maintaining a smooth 15-20% boost above the base cosine schedule.
+
+Visualize your own runs:
 
 ```bash
-# Single run (generates 8-panel plot for Velvet, 4-panel for AdamW)
-python scripts/plot_run.py outputs/phase1_pretrain/metrics.csv
-
-# Compare Velvet vs AdamW
-python scripts/plot_run.py outputs/velvet/metrics.csv outputs/adamw/metrics.csv \
-    --labels Velvet AdamW
+python scripts/plot_run.py outputs/phase1/metrics.csv outputs/adamw/metrics.csv --labels Velvet AdamW
 ```
 
-## Testing
+## Model configs
+
+| Config | d_model | Layers (local/global) | Heads | Params | Use case |
+|---|---|---|---|---|---|
+| `small` | 256 | 4 / 4 | 4 / 4 | ~5M | Debug, fast iteration |
+| `base` | 384 | 6 / 8 | 6 / 8 | ~50M | Production |
+
+Optional modes add minimal overhead: ACR adds ~0.7% params (scanner), iterative reasoning adds ~1.6% params (LoRA bank + halting unit).
+
+## Training phases
+
+**Phase 1 — Base pretraining.** Standard LM training. All params trained with cross-entropy. LR 3e-4, cosine decay, 2K warmup. Takes ~100K steps on CulturaX to reach Chinchilla optimal (~20:1 tokens/params ratio).
+
+**Phase 2 — ACR finetuning.** Enables adaptive routing. Loads Phase 1 checkpoint with `strict=False` to add new modules. Base params get LR×0.1, ACR params get full LR. Loss is CE + load_balance + entropy + compute_cost. Takes ~50K steps.
+
+**Phase 3 — Iterative reasoning.** Freezes base model, only trains LoRA bank + halting unit + iteration embeddings. Loss is CE + halting + deep_supervision (each iteration's output gets supervised). Takes ~30K steps.
+
+Each phase resumes from the previous: `training.resume_from=outputs/phase1/ckpt_final.pt`
+
+## Configuration
+
+Hydra configs live in `configs/`. Override anything from CLI:
 
 ```bash
-# Architecture tests (shapes, gradients, memory persistence)
-python tests/test_architecture.py
+# Smaller batch, longer run
+python scripts/train.py training=phase1_pretrain training.batch_size=16 training.max_steps=20000
 
-# ACR tests (routing, gating, load balance)
-python tests/test_acr.py
+# Use small model for quick tests
+python scripts/train.py training=phase1_pretrain model=small
 
-# Iterative reasoning tests (LoRA, halting, deep supervision)
-python tests/test_iterative_reasoning.py
+# Enable wandb logging
+python scripts/train.py training=phase1_pretrain training.wandb=true training.wandb_project=my-project
 ```
 
-## Project Structure
+Debug mode runs 500 steps with 10-step logging:
+
+```bash
+python scripts/train.py training=phase1_pretrain training.debug=true
+```
+
+## Kernel backends
+
+VelvetOptimizer has three backends, auto-detected by priority:
+
+**Triton** (fastest): Fused kernel, single kernel launch per parameter update. Requires `triton` package + CUDA GPU.
+
+**CUDA** (fallback): Native CUDA kernel via cpp_extension. ~80% of Triton speed.
+
+**PyTorch** (baseline): Pure PyTorch fallback for CPU or when extensions aren't available.
+
+The optimizer prints which backend is active at training start.
+
+## Project structure
 
 ```
 R-Velvet/
 ├── rvelvet/
-│   ├── __init__.py
-│   ├── model.py                     # RVelvet main model
-│   ├── layers/
-│   │   ├── local_attention.py       # Windowed self-attention
-│   │   ├── segment_compressor.py    # Learned compression
-│   │   ├── global_reasoner.py       # Full attention on concepts
-│   │   ├── memory_controller.py     # External semantic memory
-│   │   ├── adaptive_router.py       # ACR scanner + router
-│   │   ├── lora_adapter.py          # Per-iteration LoRA
-│   │   ├── halting.py               # PonderNet halting
-│   │   └── iterative_reasoner.py    # Multi-pass orchestrator
-│   ├── data/
-│   │   └── text_dataset.py          # Memmap text dataset
+│   ├── model.py                     # Main model
+│   ├── layers/                      # All architecture components
+│   ├── data/                        # Dataset loaders
 │   └── training/
-│       ├── losses.py                # Per-phase loss computation
-│       ├── trainer.py               # Shared training loop
-│       ├── velvet_optimizer.py      # VelvetOptimizer (AdamW + PGM + LVS)
-│       └── kernels/
-│           ├── velvet_triton.py     # Triton fused kernel
-│           ├── velvet_cuda.py       # CUDA fallback kernel
-│           ├── fused_ce.py          # Fused cross-entropy
-│           └── era_triton.py        # ERA Triton kernel
-├── configs/
-│   ├── config.yaml
-│   ├── model/
-│   ├── training/
-│   └── data/
+│       ├── trainer.py               # Training loop
+│       ├── velvet_optimizer.py      # Custom optimizer
+│       └── kernels/                 # Triton/CUDA kernels
+├── configs/                         # Hydra configs
 ├── scripts/
-│   ├── train.py                     # Hydra entry point
-│   ├── tokenize_data.py             # Text → .bin tokenizer
-│   ├── plot_run.py                  # Training metrics visualization
-│   ├── train_tokenizer.py           # BPE tokenizer training
-│   └── download_culturax.py         # CulturaX dataset downloader
-├── tests/
-│   ├── test_architecture.py
-│   ├── test_acr.py
-│   └── test_iterative_reasoning.py
-└── requirements.txt
+│   ├── train.py                     # Main entry point
+│   ├── train_tokenizer.py           # BPE training
+│   ├── tokenize_data.py             # Corpus → .bin
+│   ├── plot_run.py                  # Visualize training
+│   └── download_culturax.py         # Dataset downloader
+└── tests/                           # Unit tests
 ```
+
+## Tests
+
+```bash
+python tests/test_architecture.py     # Shapes, gradients, memory
+python tests/test_acr.py              # Routing, load balance
+python tests/test_iterative_reasoning.py  # LoRA, halting
+```
+
+## License
+
+MIT
