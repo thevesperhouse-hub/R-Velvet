@@ -6,7 +6,7 @@
 ![Triton](https://img.shields.io/badge/Triton-3.0+-blueviolet.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
-Multi-scale transformer that handles 1M+ token contexts by compressing intelligently, reasoning globally, and remembering selectively. Instead of brute-forcing quadratic attention, R-Velvet processes local windows cheaply, compresses them into abstract "concepts", and runs full attention only over these concepts. The result is ~3800x cheaper than full quadratic for million-token sequences.
+Multi-scale transformer that handles 1M+ token contexts by compressing intelligently, reasoning globally, and remembering selectively. Instead of brute-forcing quadratic attention, R-Velvet processes local windows cheaply, compresses them into abstract "concepts", and runs full attention only over these concepts. Theoretical estimates suggest this could be ~3800x cheaper than full quadratic for million-token sequences (currently being tested).
 
 Comes with **VelvetOptimizer**, a custom optimizer that beats AdamW by adapting momentum (PGM) and learning rate (LVS) based on training dynamics. Converges faster and maintains the advantage through late training.
 
@@ -70,25 +70,13 @@ cd R-Velvet
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# Get data (using our CulturaX subset)
-pip install huggingface_hub
-huggingface-cli login --token YOUR_HF_TOKEN
-huggingface-cli download AkiraXan/R-Velvet_CulturaX_sub train.bin --local-dir data/ --repo-type dataset
-
-# Train base model
-python scripts/train.py training=phase1_pretrain model=base data=text
-```
-
-Or train your own tokenizer and use custom data:
-
-```bash
 # Train BPE tokenizer (vocab size 32K)
 python scripts/train_tokenizer.py --input corpus.txt --output data/velvet_tok
 
 # Tokenize your corpus
 python scripts/tokenize_data.py --input corpus.txt --output data/train.bin --tokenizer data/velvet_tok
 
-# Train
+# Train base model
 python scripts/train.py training=phase1_pretrain model=base data=text
 ```
 
