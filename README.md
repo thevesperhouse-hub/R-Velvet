@@ -144,7 +144,7 @@ To use AdamW instead, set `training.optimizer=adamw` in configs.
 
 ![Comparison](assets/comparison.png)
 
-Velvet converges faster and maintains a consistent advantage throughout training. Final loss: **3.69** (Velvet) vs **3.72** (AdamW). The LR plot shows Velvet maintaining a smooth 15-20% boost above the base cosine schedule.
+Velvet converges faster and maintains a consistent advantage throughout training. Final loss: **3.59** (Velvet) vs **3.61** (AdamW). The LR plot shows Velvet maintaining a smooth 15-20% boost above the base cosine schedule.
 
 Visualize your own runs:
 
