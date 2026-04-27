@@ -107,21 +107,22 @@ class VelvetOptimizer(Optimizer):
         """Set total training steps and compute adaptive EMA windows.
 
         Windows scale with run length (Chinchilla-inspired):
-          - Current EMA: 3% of max_steps (min 50, max 300)
-          - Anchor EMA: starts at 10% → grows to 30% over training
-        Short runs (500 steps): current=50, anchor=50→150
-        Long runs (100K steps): current=300, anchor=300→300 (capped)
+          - Current EMA: 2% of max_steps (capped 50-150)
+          - Anchor EMA: always ≥ 3x current, scales with max_steps
+          - Ratio between anchor/current ≈ 4-8x (ensures meaningful gap)
+        Examples:
+          3,500 steps: current=70, anchor=280→875
+          12,000 steps: current=150, anchor=1200→3000
+          100,000 steps: current=150, anchor=2000→5000
         """
         self._lvs_phase_steps = max(max_steps, 1)
 
-        # Adaptive window sizing
-        self._current_window = max(50, min(300, int(max_steps * 0.03)))
-        self._anchor_window_min = max(100, min(300, int(max_steps * 0.10)))
-        self._anchor_window_max = max(200, min(500, int(max_steps * 0.30)))
+        # Current window: fast EMA, capped low to stay responsive
+        self._current_window = max(50, min(150, int(max_steps * 0.02)))
 
-        # Ensure anchor_min <= anchor_max
-        if self._anchor_window_min > self._anchor_window_max:
-            self._anchor_window_min = self._anchor_window_max
+        # Anchor windows: always ≥ 3x current, scales up with run length
+        self._anchor_window_min = max(self._current_window * 3, min(2000, int(max_steps * 0.10)))
+        self._anchor_window_max = max(self._anchor_window_min, min(5000, int(max_steps * 0.25)))
 
         # Set initial alphas
         self._ema_current_alpha = 2.0 / (self._current_window + 1)
