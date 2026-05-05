@@ -1,40 +1,51 @@
 """
-Train a BPE tokenizer for R-Velvet (FR-tuned by default).
+Train a tokenizer for R-Velvet (FR-tuned by default).
 
-Defaults to 64k vocab — sweet spot for 1.3B-2.5B FR models. Adaptive dtype
-in tokenize_data.py handles >65k automatically (uint32).
+Two algorithms supported:
+  --algo unigram  (default)  SentencePiece-style Unigram LM. Optimizes log-
+                             likelihood globally rather than greedy bottom-up
+                             merging. Used by Mistral, Gemma, T5, BLOOM. Gives
+                             ~5-10% better compression than BPE on FR at the
+                             same vocab size.
+  --algo bpe                 Byte-level BPE with FR-aware Split layer.
 
-Pre-tokenizer is byte-level + a Split layer that breaks French contractions
-(l', d', qu', etc.) and digit runs into individual digits. This gives the BPE
-merger room to learn meaningful sub-words on FR text rather than fusing
-contractions + numbers into rare merges.
+Default vocab is 80k — sweet spot for FR-only models targeting 5+ chars/token
+(exceptional tier). Adaptive dtype in tokenize_data.py handles >65k (uint32).
 
-Sources:
-    --input <file>                       single local text file
-    --hf-source <repo>:<name>:<split>    streaming HF dataset (e.g.
-                                          HuggingFaceFW/fineweb-2:fra_Latn:train)
+Sources (multiple supported, with optional weight for mixing):
+    --input <file>                                 single local text file
+    --hf-source <repo>:<name>:<split>[@<weight>]   streaming HF dataset
+                                                   pass multiple times to mix
 
 Usage:
-    # Local file, default 64k FR
-    python scripts/train_tokenizer.py --input data/corpus_fr.txt --output data/velvet_tok_64k
+    # Local file, default unigram 80k FR
+    python scripts/train_tokenizer.py --input data/corpus_fr.txt --output data/velvet_tok_80k
 
     # Stream from FineWeb-2 FR (no full download needed)
     python scripts/train_tokenizer.py \
         --hf-source HuggingFaceFW/fineweb-2:fra_Latn:train \
         --max-examples 5_000_000 \
-        --output data/velvet_tok_64k
+        --output data/velvet_tok_80k
 
-    # Custom vocab size
-    python scripts/train_tokenizer.py --input corpus.txt --output data/tok_100k --vocab-size 100000
+    # Combo gagnant: FineWeb (70%) + Wikipedia FR (30%), Unigram 80k
+    python scripts/train_tokenizer.py \
+        --hf-source HuggingFaceFW/fineweb-2:fra_Latn:train@0.7 \
+        --hf-source wikimedia/wikipedia:20231101.fr:train@0.3 \
+        --vocab-size 80000 \
+        --max-examples 8_000_000 \
+        --output data/velvet_tok_80k_unigram
+
+    # Old-school BPE for comparison / baseline
+    python scripts/train_tokenizer.py --algo bpe --input corpus.txt --output data/tok_bpe
 """
 
 import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Iterator, List, Optional, Tuple
 
-# ByteLevel BPE produces non-ASCII display tokens (Ġ U+0120 etc.).
+# Unigram / ByteLevel can produce non-ASCII display tokens (▁ U+2581, Ġ U+0120).
 # Reconfigure stdout to UTF-8 on Windows where cp1252 is the default.
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -52,9 +63,17 @@ def _iter_local_file(path: str, max_examples: Optional[int]) -> Iterator[str]:
                 return
 
 
-def _iter_hf_stream(spec: str, max_examples: Optional[int],
-                    text_field: str = "text") -> Iterator[str]:
-    """spec format: '<repo>:<name>:<split>' or '<repo>::<split>' if no config."""
+def _parse_hf_spec(spec: str) -> Tuple[str, Optional[str], str, float]:
+    """spec format:
+        '<repo>:<name>:<split>'           weight defaults to 1.0
+        '<repo>::<split>'                 no config
+        '<repo>:<name>:<split>@<weight>'  explicit mixing weight
+    """
+    weight = 1.0
+    if "@" in spec:
+        spec, w = spec.rsplit("@", 1)
+        weight = float(w)
+
     parts = spec.split(":")
     if len(parts) == 2:
         repo, split = parts
@@ -66,12 +85,41 @@ def _iter_hf_stream(spec: str, max_examples: Optional[int],
     else:
         raise ValueError(
             f"Bad --hf-source spec {spec!r}. "
-            "Expected '<repo>:<name>:<split>' or '<repo>::<split>'."
+            "Expected '<repo>:<name>:<split>[@<weight>]' or '<repo>::<split>[@<weight>]'."
+        )
+    return repo, name, split, weight
+
+
+def _iter_hf_streams(specs: List[str], max_examples: Optional[int],
+                     text_field: str = "text") -> Iterator[str]:
+    """Stream from one or more HF datasets, interleaved by weight if multiple."""
+    from datasets import load_dataset, interleave_datasets
+
+    parsed = [_parse_hf_spec(s) for s in specs]
+
+    datasets_list = []
+    weights = []
+    for repo, name, split, weight in parsed:
+        ds = load_dataset(repo, name=name, split=split, streaming=True)
+        print(f"  HF streaming: {repo} (config={name}, split={split}, weight={weight})")
+        datasets_list.append(ds)
+        weights.append(weight)
+
+    if len(datasets_list) == 1:
+        ds = datasets_list[0]
+    else:
+        # Normalize weights into probabilities. all_exhausted keeps sampling
+        # from each stream until every one runs dry — gives true mixing rather
+        # than stopping at the smallest source.
+        total = sum(weights)
+        probs = [w / total for w in weights]
+        print(f"  Interleaving {len(datasets_list)} sources with probs={probs}")
+        ds = interleave_datasets(
+            datasets_list,
+            probabilities=probs,
+            stopping_strategy="all_exhausted",
         )
 
-    from datasets import load_dataset
-    ds = load_dataset(repo, name=name, split=split, streaming=True)
-    print(f"  HF streaming: {repo} (config={name}, split={split})")
     n = 0
     for example in ds:
         txt = example.get(text_field) or ""
@@ -83,35 +131,41 @@ def _iter_hf_stream(spec: str, max_examples: Optional[int],
             return
 
 
-def _build_corpus_iterator(args) -> Iterable[str]:
+def _build_corpus_iterator(args, max_examples: Optional[int] = None) -> Iterable[str]:
+    """`max_examples` overrides args.max_examples if given (used for eval split)."""
+    cap = max_examples if max_examples is not None else args.max_examples
     if args.input:
-        return _iter_local_file(args.input, args.max_examples)
+        return _iter_local_file(args.input, cap)
     if args.hf_source:
-        return _iter_hf_stream(args.hf_source, args.max_examples,
-                               text_field=args.text_field)
+        return _iter_hf_streams(args.hf_source, cap, text_field=args.text_field)
     raise SystemExit("Provide either --input or --hf-source.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train a BPE tokenizer (FR-tuned) for R-Velvet")
+        description="Train a tokenizer (FR-tuned) for R-Velvet")
+    parser.add_argument("--algo", choices=["unigram", "bpe"], default="unigram",
+                        help="Tokenization algorithm. unigram is recommended for FR "
+                             "(matches Mistral/Gemma/T5). bpe kept for baseline.")
     parser.add_argument("--input", type=str, default=None,
                         help="Local text file (one document or one line per doc)")
-    parser.add_argument("--hf-source", type=str, default=None,
-                        help="HF streaming spec '<repo>:<name>:<split>'")
+    parser.add_argument("--hf-source", type=str, action="append", default=None,
+                        help="HF streaming spec '<repo>:<name>:<split>[@<weight>]'. "
+                             "Pass multiple times to mix sources by weight.")
     parser.add_argument("--text-field", type=str, default="text",
                         help="Column name for HF datasets (default 'text')")
-    parser.add_argument("--output", type=str, default="data/velvet_tok_64k",
+    parser.add_argument("--output", type=str, default="data/velvet_tok_80k",
                         help="Output tokenizer directory")
-    parser.add_argument("--vocab-size", type=int, default=64000,
-                        help="Vocabulary size. 64k is the FR sweet spot. "
-                             ">65535 stays valid (adaptive dtype handles it).")
+    parser.add_argument("--vocab-size", type=int, default=80000,
+                        help="Vocabulary size. 80k targets exceptional FR "
+                             "compression (>= 5.0 chars/token). Adaptive dtype "
+                             "handles >65535 automatically.")
     parser.add_argument("--max-examples", type=int, default=None,
                         help="Cap on lines/examples to train on (None = all)")
     parser.add_argument("--min-frequency", type=int, default=2,
-                        help="Min token frequency to keep")
+                        help="Min token frequency to keep (BPE only)")
     parser.add_argument("--no-fr-pretokenizer", action="store_true",
-                        help="Disable the FR-specific Split layer (contractions, digits)")
+                        help="(BPE only) Disable the FR-specific Split layer")
     parser.add_argument("--eval-docs", type=int, default=2000,
                         help="After training, stream N held-out docs and report "
                              "real chars/token. Set 0 to skip. Default 2000.")
@@ -125,73 +179,77 @@ def main():
     from tokenizers.processors import TemplateProcessing
     from transformers import PreTrainedTokenizerFast
 
-    print("Training BPE tokenizer")
+    print(f"Training {args.algo.upper()} tokenizer")
     src = args.input or args.hf_source
     print(f"  Source:       {src}")
     print(f"  Vocab size:   {args.vocab_size:,}")
     print(f"  Max examples: {args.max_examples or 'all'}")
-    print(f"  FR pre-tok:   {'off' if args.no_fr_pretokenizer else 'on'}")
 
-    tokenizer = Tokenizer(models.BPE())
+    special_tokens = ["<|endoftext|>", "<|padding|>", "<|unknown|>"]
 
     # NFC keeps composed forms (œ, é) — important for FR vocabulary efficiency.
-    tokenizer.normalizer = normalizers.Sequence([
+    common_normalizer = normalizers.Sequence([
         normalizers.NFC(),
         normalizers.Replace("``", '"'),
         normalizers.Replace("''", '"'),
     ])
 
-    # FR-aware pre-tokenizer (single regex Split + byte-only ByteLevel).
-    #
-    # The previous design (separate Split layers for apostrophes and digits,
-    # followed by default ByteLevel) was broken: ByteLevel's internal GPT-2
-    # regex re-split `d'` -> [d, '] and `aujourd'` -> [aujourd, '], which
-    # undid the apostrophe isolation and starved BPE of the contractions.
-    # Result was ~3.0 chars/token (GPT-2 level) instead of the 4.5+ target.
-    #
-    # New design: one comprehensive regex inspired by the GPT-2 / LLaMA
-    # pretokenize patterns, then ByteLevel with use_regex=False so it only
-    # byte-encodes without re-splitting.
-    #
-    # The regex captures, in priority order:
-    #   ` ?\p{L}+'?`       optional leading space + letters + optional trailing apostrophe
-    #                      -> keeps `aujourd'`, `l'`, `d'`, `Qu'` as single units
-    #                      -> attaches the space to the next word (GPT-2 convention)
-    #   ` ?\p{N}{1,3}`     1-3 digit groups (LLaMA-style); avoids splitting numbers
-    #                      character-by-character which wastes ~50% of tokens on numbers.
-    #   ` ?[^\s\p{L}\p{N}]+`  punctuation runs, optionally with leading space
-    #   `\s+`              remaining whitespace runs (indents, double spaces)
-    if not args.no_fr_pretokenizer:
-        FR_PRETOKENIZE_REGEX = (
-            r" ?\p{L}+'?"
-            r"| ?\p{N}{1,3}"
-            r"| ?[^\s\p{L}\p{N}]+"
-            r"|\s+"
+    if args.algo == "unigram":
+        # SentencePiece-style: Metaspace replaces whitespace with ▁ marker
+        # and operates on raw Unicode chars (no byte-level encoding). For FR,
+        # this means `é` is a single token char rather than 2 bytes — saves
+        # roughly 5-10% on accent-heavy text.
+        tokenizer = Tokenizer(models.Unigram())
+        tokenizer.normalizer = common_normalizer
+        tokenizer.pre_tokenizer = pre_tokenizers.Metaspace(
+            replacement="▁",
+            prepend_scheme="always",
         )
-        tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
-            pre_tokenizers.Split(
-                pattern=Regex(FR_PRETOKENIZE_REGEX),
-                behavior="isolated",
-            ),
-            # use_regex=False disables ByteLevel's GPT-2 splitter so it doesn't
-            # undo the Split above. add_prefix_space=False because our regex
-            # already attaches leading spaces to the right token.
-            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
-        ])
+        tokenizer.decoder = decoders.Metaspace(
+            replacement="▁",
+            prepend_scheme="always",
+        )
+        trainer = trainers.UnigramTrainer(
+            vocab_size=args.vocab_size,
+            special_tokens=special_tokens,
+            unk_token="<|unknown|>",
+            show_progress=True,
+        )
     else:
-        # Plain GPT-2-style ByteLevel BPE (no FR-specific handling).
-        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    tokenizer.decoder = decoders.ByteLevel()
+        # FR-aware byte-level BPE.
+        #
+        # The pre-tokenizer combines a comprehensive regex Split with a
+        # ByteLevel(use_regex=False). Without use_regex=False the GPT-2
+        # internal regex re-splits `d'`, `l'`, `aujourd'` into pieces and
+        # starves BPE of contractions — that path scored ~3.0 chars/token.
+        tokenizer = Tokenizer(models.BPE())
+        tokenizer.normalizer = common_normalizer
 
-    special_tokens = ["<|endoftext|>", "<|padding|>", "<|unknown|>"]
+        if not args.no_fr_pretokenizer:
+            FR_PRETOKENIZE_REGEX = (
+                r" ?\p{L}+'?"
+                r"| ?\p{N}{1,3}"
+                r"| ?[^\s\p{L}\p{N}]+"
+                r"|\s+"
+            )
+            tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
+                pre_tokenizers.Split(
+                    pattern=Regex(FR_PRETOKENIZE_REGEX),
+                    behavior="isolated",
+                ),
+                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            ])
+        else:
+            tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+        tokenizer.decoder = decoders.ByteLevel()
 
-    trainer = trainers.BpeTrainer(
-        vocab_size=args.vocab_size,
-        min_frequency=args.min_frequency,
-        special_tokens=special_tokens,
-        show_progress=True,
-        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
-    )
+        trainer = trainers.BpeTrainer(
+            vocab_size=args.vocab_size,
+            min_frequency=args.min_frequency,
+            special_tokens=special_tokens,
+            show_progress=True,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        )
 
     print("\nTraining...")
     t0 = time.time()
@@ -239,9 +297,7 @@ def main():
         total_tokens += len(ids)
         total_chars += len(sent)
 
-    # Subtract EOS contribution: each test sentence had <|endoftext|> appended,
-    # which inflates token count by 1 per sentence and is irrelevant to the
-    # tokenizer's compression quality.
+    # EOS-excluded ratio (each test had <|endoftext|> appended).
     total_tokens_no_eos = total_tokens - len(test_sentences)
     ratio = total_chars / max(1, total_tokens_no_eos)
     print(f"\n  Avg chars/token (synthetic, EOS-excluded): {ratio:.2f}")
@@ -249,26 +305,14 @@ def main():
           f"single-char tokens\n    (punctuation, English loanwords, time/currency "
           f"formats). Real FR prose\n    typically scores +0.5 to +1.0 above this.")
 
-    # Honest evaluation: stream a held-out chunk of real text and measure
-    # chars/token on actual prose. This is the number that should drive your
-    # decision about retraining vs vocab bumping.
+    # Honest evaluation: stream a held-out chunk of real text.
     if args.eval_docs > 0:
         print(f"\nEvaluating on {args.eval_docs:,} held-out docs from the source...")
         try:
-            # Reuse the same iterator builder so HF/local source works identically.
-            # We re-stream from the start; if --max-examples was set, we grab the
-            # next args.eval_docs after that. For local files we just take the
-            # first eval_docs lines (simple, deterministic).
             eval_iter = _build_corpus_iterator(
-                argparse.Namespace(
-                    input=args.input,
-                    hf_source=args.hf_source,
-                    text_field=args.text_field,
-                    max_examples=(args.max_examples or 0) + args.eval_docs,
-                )
+                args,
+                max_examples=(args.max_examples or 0) + args.eval_docs,
             )
-            # Skip the docs we already trained on (only matters for local files;
-            # HF streaming doesn't guarantee identical order anyway).
             eval_chars = 0
             eval_tokens = 0
             n_eval = 0
@@ -287,7 +331,7 @@ def main():
                 print(f"  Total chars:     {eval_chars:,}")
                 print(f"  Total tokens:    {eval_tokens:,}")
                 print(f"  Real chars/token: {real_ratio:.3f}  "
-                      f"(target: >= 4.0 OK, >= 4.5 excellent for FR)")
+                      f"(>= 4.0 OK, >= 4.5 excellent, >= 5.0 exceptional)")
             else:
                 print("  No held-out docs available for evaluation.")
         except Exception as e:
