@@ -138,31 +138,46 @@ def main():
         normalizers.Replace("''", '"'),
     ])
 
-    # FR-aware pre-tokenizer.
-    # 1. Split apostrophe-contractions: l'amour -> ["l'", "amour"]
-    #    (regex: keep the apostrophe attached to the leading letter).
-    # 2. Split digit runs into individual digits (avoids 1234567 becoming
-    #    one rare token).
-    # 3. ByteLevel afterwards for the BPE merge alphabet.
-    pre_tokens = []
+    # FR-aware pre-tokenizer (single regex Split + byte-only ByteLevel).
+    #
+    # The previous design (separate Split layers for apostrophes and digits,
+    # followed by default ByteLevel) was broken: ByteLevel's internal GPT-2
+    # regex re-split `d'` -> [d, '] and `aujourd'` -> [aujourd, '], which
+    # undid the apostrophe isolation and starved BPE of the contractions.
+    # Result was ~3.0 chars/token (GPT-2 level) instead of the 4.5+ target.
+    #
+    # New design: one comprehensive regex inspired by the GPT-2 / LLaMA
+    # pretokenize patterns, then ByteLevel with use_regex=False so it only
+    # byte-encodes without re-splitting.
+    #
+    # The regex captures, in priority order:
+    #   ` ?\p{L}+'?`       optional leading space + letters + optional trailing apostrophe
+    #                      -> keeps `aujourd'`, `l'`, `d'`, `Qu'` as single units
+    #                      -> attaches the space to the next word (GPT-2 convention)
+    #   ` ?\p{N}{1,3}`     1-3 digit groups (LLaMA-style); avoids splitting numbers
+    #                      character-by-character which wastes ~50% of tokens on numbers.
+    #   ` ?[^\s\p{L}\p{N}]+`  punctuation runs, optionally with leading space
+    #   `\s+`              remaining whitespace runs (indents, double spaces)
     if not args.no_fr_pretokenizer:
-        # Isolate apostrophe-suffixed letters (l', d', qu', n', etc.) so the
-        # BPE merger treats them as units rather than fusing into the next word.
-        pre_tokens.append(
-            pre_tokenizers.Split(
-                pattern=Regex(r"[a-zA-Zà-ÿœæÀ-ŸŒÆ]'"),
-                behavior="isolated",
-            )
+        FR_PRETOKENIZE_REGEX = (
+            r" ?\p{L}+'?"
+            r"| ?\p{N}{1,3}"
+            r"| ?[^\s\p{L}\p{N}]+"
+            r"|\s+"
         )
-        # Isolate digits — prevents long number runs from becoming rare tokens.
-        pre_tokens.append(
+        tokenizer.pre_tokenizer = pre_tokenizers.Sequence([
             pre_tokenizers.Split(
-                pattern=Regex(r"\d"),
+                pattern=Regex(FR_PRETOKENIZE_REGEX),
                 behavior="isolated",
-            )
-        )
-    pre_tokens.append(pre_tokenizers.ByteLevel(add_prefix_space=False))
-    tokenizer.pre_tokenizer = pre_tokenizers.Sequence(pre_tokens)
+            ),
+            # use_regex=False disables ByteLevel's GPT-2 splitter so it doesn't
+            # undo the Split above. add_prefix_space=False because our regex
+            # already attaches leading spaces to the right token.
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+        ])
+    else:
+        # Plain GPT-2-style ByteLevel BPE (no FR-specific handling).
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tokenizer.decoder = decoders.ByteLevel()
 
     special_tokens = ["<|endoftext|>", "<|padding|>", "<|unknown|>"]
