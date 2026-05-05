@@ -1,52 +1,168 @@
 """
-Train a BPE tokenizer on French text corpus.
+Train a BPE tokenizer for R-Velvet (FR-tuned by default).
 
-Produces a HuggingFace-compatible tokenizer that can be loaded with
-AutoTokenizer.from_pretrained("data/tokenizer_fr").
+Defaults to 64k vocab — sweet spot for 1.3B-2.5B FR models. Adaptive dtype
+in tokenize_data.py handles >65k automatically (uint32).
+
+Pre-tokenizer is byte-level + a Split layer that breaks French contractions
+(l', d', qu', etc.) and digit runs into individual digits. This gives the BPE
+merger room to learn meaningful sub-words on FR text rather than fusing
+contractions + numbers into rare merges.
+
+Sources:
+    --input <file>                       single local text file
+    --hf-source <repo>:<name>:<split>    streaming HF dataset (e.g.
+                                          HuggingFaceFW/fineweb-2:fra_Latn:train)
 
 Usage:
-    # Train on the full corpus
-    python scripts/train_tokenizer.py --input data/corpus_fr.txt --output data/tokenizer_fr
+    # Local file, default 64k FR
+    python scripts/train_tokenizer.py --input data/corpus_fr.txt --output data/velvet_tok_64k
 
-    # Quick test on a small sample
-    python scripts/train_tokenizer.py --input data/corpus_fr.txt --output data/tokenizer_fr --max_lines 1000000
+    # Stream from FineWeb-2 FR (no full download needed)
+    python scripts/train_tokenizer.py \
+        --hf-source HuggingFaceFW/fineweb-2:fra_Latn:train \
+        --max-examples 5_000_000 \
+        --output data/velvet_tok_64k
 
     # Custom vocab size
-    python scripts/train_tokenizer.py --input data/corpus_fr.txt --output data/tokenizer_fr --vocab_size 32000
+    python scripts/train_tokenizer.py --input corpus.txt --output data/tok_100k --vocab-size 100000
 """
 
 import argparse
+import sys
 import time
 from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+# ByteLevel BPE produces non-ASCII display tokens (Ġ U+0120 etc.).
+# Reconfigure stdout to UTF-8 on Windows where cp1252 is the default.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
+
+
+def _iter_local_file(path: str, max_examples: Optional[int]) -> Iterator[str]:
+    n = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            yield line
+            n += 1
+            if max_examples and n >= max_examples:
+                return
+
+
+def _iter_hf_stream(spec: str, max_examples: Optional[int],
+                    text_field: str = "text") -> Iterator[str]:
+    """spec format: '<repo>:<name>:<split>' or '<repo>::<split>' if no config."""
+    parts = spec.split(":")
+    if len(parts) == 2:
+        repo, split = parts
+        name = None
+    elif len(parts) == 3:
+        repo, name, split = parts
+        if name == "":
+            name = None
+    else:
+        raise ValueError(
+            f"Bad --hf-source spec {spec!r}. "
+            "Expected '<repo>:<name>:<split>' or '<repo>::<split>'."
+        )
+
+    from datasets import load_dataset
+    ds = load_dataset(repo, name=name, split=split, streaming=True)
+    print(f"  HF streaming: {repo} (config={name}, split={split})")
+    n = 0
+    for example in ds:
+        txt = example.get(text_field) or ""
+        if not txt:
+            continue
+        yield txt + "\n"
+        n += 1
+        if max_examples and n >= max_examples:
+            return
+
+
+def _build_corpus_iterator(args) -> Iterable[str]:
+    if args.input:
+        return _iter_local_file(args.input, args.max_examples)
+    if args.hf_source:
+        return _iter_hf_stream(args.hf_source, args.max_examples,
+                               text_field=args.text_field)
+    raise SystemExit("Provide either --input or --hf-source.")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train BPE tokenizer on French text")
-    parser.add_argument("--input", type=str, required=True, help="Input text file (corpus_fr.txt)")
-    parser.add_argument("--output", type=str, default="data/tokenizer_fr", help="Output tokenizer directory")
-    parser.add_argument("--vocab_size", type=int, default=32000, help="Vocabulary size")
-    parser.add_argument("--max_lines", type=int, default=None, help="Max lines to train on (None = all)")
-    parser.add_argument("--min_frequency", type=int, default=2, help="Min token frequency to keep")
+    parser = argparse.ArgumentParser(
+        description="Train a BPE tokenizer (FR-tuned) for R-Velvet")
+    parser.add_argument("--input", type=str, default=None,
+                        help="Local text file (one document or one line per doc)")
+    parser.add_argument("--hf-source", type=str, default=None,
+                        help="HF streaming spec '<repo>:<name>:<split>'")
+    parser.add_argument("--text-field", type=str, default="text",
+                        help="Column name for HF datasets (default 'text')")
+    parser.add_argument("--output", type=str, default="data/velvet_tok_64k",
+                        help="Output tokenizer directory")
+    parser.add_argument("--vocab-size", type=int, default=64000,
+                        help="Vocabulary size. 64k is the FR sweet spot. "
+                             ">65535 stays valid (adaptive dtype handles it).")
+    parser.add_argument("--max-examples", type=int, default=None,
+                        help="Cap on lines/examples to train on (None = all)")
+    parser.add_argument("--min-frequency", type=int, default=2,
+                        help="Min token frequency to keep")
+    parser.add_argument("--no-fr-pretokenizer", action="store_true",
+                        help="Disable the FR-specific Split layer (contractions, digits)")
     args = parser.parse_args()
 
-    from tokenizers import Tokenizer, models, trainers, pre_tokenizers, normalizers, decoders
+    if not args.input and not args.hf_source:
+        parser.error("Provide either --input or --hf-source.")
+
+    # Local imports — keep startup snappy when --help is the goal.
+    from tokenizers import Tokenizer, Regex, models, trainers, pre_tokenizers, normalizers, decoders
     from tokenizers.processors import TemplateProcessing
     from transformers import PreTrainedTokenizerFast
 
-    print(f"Training BPE tokenizer")
-    print(f"  Input:      {args.input}")
-    print(f"  Vocab size: {args.vocab_size:,}")
-    print(f"  Max lines:  {args.max_lines or 'all'}")
+    print("Training BPE tokenizer")
+    src = args.input or args.hf_source
+    print(f"  Source:       {src}")
+    print(f"  Vocab size:   {args.vocab_size:,}")
+    print(f"  Max examples: {args.max_examples or 'all'}")
+    print(f"  FR pre-tok:   {'off' if args.no_fr_pretokenizer else 'on'}")
 
     tokenizer = Tokenizer(models.BPE())
 
+    # NFC keeps composed forms (œ, é) — important for FR vocabulary efficiency.
     tokenizer.normalizer = normalizers.Sequence([
         normalizers.NFC(),
         normalizers.Replace("``", '"'),
         normalizers.Replace("''", '"'),
     ])
 
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    # FR-aware pre-tokenizer.
+    # 1. Split apostrophe-contractions: l'amour -> ["l'", "amour"]
+    #    (regex: keep the apostrophe attached to the leading letter).
+    # 2. Split digit runs into individual digits (avoids 1234567 becoming
+    #    one rare token).
+    # 3. ByteLevel afterwards for the BPE merge alphabet.
+    pre_tokens = []
+    if not args.no_fr_pretokenizer:
+        # Isolate apostrophe-suffixed letters (l', d', qu', n', etc.) so the
+        # BPE merger treats them as units rather than fusing into the next word.
+        pre_tokens.append(
+            pre_tokenizers.Split(
+                pattern=Regex(r"[a-zA-Zà-ÿœæÀ-ŸŒÆ]'"),
+                behavior="isolated",
+            )
+        )
+        # Isolate digits — prevents long number runs from becoming rare tokens.
+        pre_tokens.append(
+            pre_tokenizers.Split(
+                pattern=Regex(r"\d"),
+                behavior="isolated",
+            )
+        )
+    pre_tokens.append(pre_tokenizers.ByteLevel(add_prefix_space=False))
+    tokenizer.pre_tokenizer = pre_tokenizers.Sequence(pre_tokens)
     tokenizer.decoder = decoders.ByteLevel()
 
     special_tokens = ["<|endoftext|>", "<|padding|>", "<|unknown|>"]
@@ -59,23 +175,9 @@ def main():
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
 
-    input_files = [args.input]
-
-    if args.max_lines:
-        print(f"\n  Extracting first {args.max_lines:,} lines...")
-        subset_path = args.input + ".subset"
-        with open(args.input, 'r', encoding='utf-8') as f_in, \
-             open(subset_path, 'w', encoding='utf-8') as f_out:
-            for i, line in enumerate(f_in):
-                if i >= args.max_lines:
-                    break
-                f_out.write(line)
-        input_files = [subset_path]
-        print(f"  Subset saved: {subset_path}")
-
-    print(f"\nTraining...")
+    print("\nTraining...")
     t0 = time.time()
-    tokenizer.train(input_files, trainer)
+    tokenizer.train_from_iterator(_build_corpus_iterator(args), trainer)
     elapsed = time.time() - t0
     print(f"  Done in {elapsed:.1f}s")
     print(f"  Vocab size: {tokenizer.get_vocab_size():,}")
@@ -100,33 +202,28 @@ def main():
     print(f"\nSaved to: {output_dir}")
     print(f"  Files: {[f.name for f in output_dir.iterdir()]}")
 
+    # Validation: encoding sanity + chars/token ratio on FR sentences.
     test_sentences = [
         "Bonjour, comment allez-vous aujourd'hui ?",
         "Le développement de l'intelligence artificielle progresse rapidement.",
         "R-Velvet compresse 1M de tokens en 500 concepts.",
+        "Les œufs et le bœuf coûtent 12,50 € au marché.",
+        "Qu'est-ce que tu fais demain à 14h30 ?",
     ]
-    print(f"\nTest encoding:")
+    print("\nTest encoding:")
     total_tokens = 0
     total_chars = 0
     for sent in test_sentences:
         ids = hf_tokenizer.encode(sent)
-        decoded = hf_tokenizer.decode(ids)
         tokens = hf_tokenizer.convert_ids_to_tokens(ids)
         print(f"  \"{sent}\"")
-        print(f"    → {len(ids)} tokens: {tokens[:10]}{'...' if len(tokens) > 10 else ''}")
-        print(f"    → decoded: \"{decoded}\"")
+        print(f"    -> {len(ids)} tokens: {tokens[:12]}{'...' if len(tokens) > 12 else ''}")
         total_tokens += len(ids)
         total_chars += len(sent)
 
-    ratio = total_chars / total_tokens
-    print(f"\n  Avg chars/token: {ratio:.2f} (GPT-2 on French ≈ 3.0, good French BPE ≈ 4.5+)")
-
-    if args.vocab_size > 65535:
-        print(f"\n  WARNING: vocab_size {args.vocab_size} > 65535. tokenize_data.py uses uint16!")
-        print(f"  Either reduce vocab_size or switch to uint32.")
-
-    if args.max_lines:
-        Path(args.input + ".subset").unlink(missing_ok=True)
+    ratio = total_chars / max(1, total_tokens)
+    print(f"\n  Avg chars/token: {ratio:.2f} "
+          f"(target: >= 4.0 for FR; GPT-2 ~3.0, well-tuned FR BPE ~4.5+)")
 
 
 if __name__ == "__main__":
