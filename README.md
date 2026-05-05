@@ -76,13 +76,19 @@ python scripts/train_tokenizer.py --input corpus.txt --output data/velvet_tok_64
 # Tokenize your corpus (adaptive uint16/uint32 — works for any vocab size)
 python scripts/tokenize_data.py --input corpus.txt --output data/train.bin --tokenizer data/velvet_tok_64k
 
-# Train at any size — auto-sizing picks the dims for you
+# Launch the interactive wizard (asks size, data, ratio, steps, batch, wandb…)
+python scripts/train.py --phase phase1_pretrain
+
+# Or skip the wizard with explicit flags
 python scripts/train.py --phase phase1_pretrain --target-size 1.3B
 ```
 
+For an end-to-end cloud launch guide (GPU choice, tokenizer prep, monitoring,
+phase chaining, common pitfalls), see [`RUNBOOK.md`](RUNBOOK.md).
+
 Training happens in three phases. Phase 1 pretrains the base model, Phase 2 enables ACR, Phase 3 adds iterative reasoning. Each phase resumes from the previous checkpoint with `--resume path/to/ckpt.pt`.
 
-## Auto-sizing
+## Auto-sizing & interactive wizard
 
 Pass a target parameter budget and R-Velvet derives the model dims for you. The sizer searches `(d_model, n_local_layers, n_global_layers)` on the meta device (no allocation), scoring candidates by both param-count error and aspect-ratio deviation from the LLaMA-2/3/Mistral family (`d_model / n_total_layers ≈ 110`). Lands within ~1.5% of the target.
 
@@ -93,9 +99,13 @@ python scripts/train.py --phase phase1_pretrain --target-size 1.3B
 # Persist the auto-sized config for reuse as a preset
 python scripts/train.py --phase phase1_pretrain --target-size 2.5B --save-auto-config my_2_5b.yaml
 
-# Interactive prompt when neither --model nor --target-size is given
+# Wizard: no flags → walks size, vocab, data, seq_len, batch, ratio, steps,
+# wandb, resume in one guided pass. Recommends batch defaults from model
+# size and computes max_steps from token budget / (batch × seq × grad_accum).
 python scripts/train.py --phase phase1_pretrain
 ```
+
+The wizard explains token-to-param ratios inline (Chinchilla 20:1, modern 500:1, TinyLlama 1000:1) and shows a final summary with effective batch + total tokens before launching. See [`RUNBOOK.md`](RUNBOOK.md) for the full cloud-launch playbook.
 
 Sample output for `--target-size 1.3B --vocab-size 64000`:
 
