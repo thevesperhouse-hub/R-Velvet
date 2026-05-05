@@ -1,0 +1,65 @@
+# Phase 3 (iterative reasoning) data mix.
+#
+# Goal: data with multi-step structure so the iterative reasoner has any
+# reason to use >1 iteration. Without reasoning-heavy data, halt always
+# fires at i=1 and the LoRA bank is wasted.
+#
+# Most sources here are produced by `scripts/build_reasoning_fr.py` which
+# translates GSM8K + MATH + OlympiadBench into FR via NLLB. Run that script
+# once before pointing this config at training.
+#
+# 30% of mass goes back to base pretrain data to prevent catastrophic
+# forgetting of general FR.
+
+seq_len: 2048
+stride: null
+tokenizer: data/velvet_tok
+num_workers: 4
+prefetch_factor: 4
+shuffle_buffer: 20000
+max_doc_tokens: 8192   # math problems are short; cap protects packing
+stopping_strategy: all_exhausted
+eos_token_id: null
+
+sources:
+  # Math reasoning, FR — produced by scripts/build_reasoning_fr.py
+  - path: json
+    name: gsm8k_fr
+    split: train
+    data_files: data/reasoning_fr/gsm8k_fr.jsonl
+    weight: 35
+    text_field: text
+
+  - path: json
+    name: math_fr
+    split: train
+    data_files: data/reasoning_fr/math_fr.jsonl
+    weight: 25
+    text_field: text
+
+  # Native-FR instruct / multi-step QA
+  - path: croissantllm/croissant_dataset
+    name: chat_fr
+    split: train
+    weight: 10
+    text_field: text
+
+  - path: fquad/fquad
+    split: train
+    weight: 5
+    text_field: text
+
+  # Anti-forgetting: bring back base pretrain at reduced weight
+  - path: HuggingFaceFW/fineweb-2
+    name: fra_Latn
+    split: train
+    weight: 15
+    text_field: text
+
+  - path: wikimedia/wikipedia
+    name: 20231101.fr
+    split: train
+    weight: 10
+    text_field: text
+
+val_path: data/val.bin
