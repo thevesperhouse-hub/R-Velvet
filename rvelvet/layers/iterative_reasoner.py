@@ -116,13 +116,14 @@ class IterativeReasoner(nn.Module):
         halt_distribution = self._compute_halt_distribution(p_halts, device)
 
         if self.training:
-            final_concepts = torch.zeros_like(iteration_outputs[0])
-            final_relevance = torch.zeros_like(iteration_relevances[0])
-            for i in range(n_iterations):
-                w = halt_distribution[:, i].unsqueeze(-1).unsqueeze(-1)
-                final_concepts = final_concepts + w * iteration_outputs[i]
-                w_rel = halt_distribution[:, i].unsqueeze(-1)
-                final_relevance = final_relevance + w_rel * iteration_relevances[i]
+            # Stack once, weight, sum — single fused reduction instead of n_iterations adds.
+            stacked = torch.stack(iteration_outputs, dim=0)        # (T, B, N, D)
+            rel_stacked = torch.stack(iteration_relevances, dim=0)  # (T, B, N)
+            w = halt_distribution[:, :n_iterations].transpose(0, 1)  # (T, B)
+            w_c = w.unsqueeze(-1).unsqueeze(-1)                      # (T, B, 1, 1)
+            w_r = w.unsqueeze(-1)                                    # (T, B, 1)
+            final_concepts = (w_c * stacked).sum(dim=0)
+            final_relevance = (w_r * rel_stacked).sum(dim=0)
         else:
             final_concepts = iteration_outputs[-1]
             final_relevance = iteration_relevances[-1]

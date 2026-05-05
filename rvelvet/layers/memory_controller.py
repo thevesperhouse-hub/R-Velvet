@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ._norm import RMSNorm
+
 
 class MemoryController(nn.Module):
     """
@@ -36,6 +38,7 @@ class MemoryController(nn.Module):
         self.read_value = nn.Linear(d_model, d_model, bias=False)
         self.read_out = nn.Linear(d_model, d_model, bias=False)
         self.read_norm = RMSNorm(d_model)
+        self.dropout_p = dropout
 
         self.write_query = nn.Linear(d_model, d_model, bias=False)
         self.write_key = nn.Linear(d_model, d_model, bias=False)
@@ -83,11 +86,11 @@ class MemoryController(nn.Module):
             k = k.view(B, M, H, hd).transpose(1, 2)
             v = v.view(B, M, H, hd).transpose(1, 2)
 
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = F.softmax(attn, dim=-1)
-            attn = self.dropout(attn)
+            read_out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout_p if self.training else 0.0,
+            )
 
-            read_out = attn @ v
             read_out = read_out.transpose(1, 2).contiguous().view(B, N, D)
             read_out = self.read_out(read_out)
 
@@ -184,12 +187,3 @@ class MemoryController(nn.Module):
         }
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(d_model))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * norm * self.weight

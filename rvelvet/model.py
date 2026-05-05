@@ -20,6 +20,7 @@ from .layers.adaptive_router import (
 )
 from .layers.iterative_reasoner import IterativeReasoner
 from .layers.halting import compute_halting_loss
+from .layers._norm import RMSNorm
 import torch.nn.functional as F
 
 
@@ -537,7 +538,6 @@ class ExpansionLayer(nn.Module):
 
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self.scale = self.head_dim ** -0.5
 
         self.norm_q = RMSNorm(d_model)
         self.norm_kv = RMSNorm(d_model)
@@ -547,7 +547,7 @@ class ExpansionLayer(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout_p = dropout
 
     def forward(
         self,
@@ -560,26 +560,18 @@ class ExpansionLayer(nn.Module):
         hd = self.head_dim
 
         q = self.q_proj(self.norm_q(tokens)).view(B, L, H, hd).transpose(1, 2)
-        k = self.k_proj(self.norm_kv(concepts)).view(B, N, H, hd).transpose(1, 2)
-        v = self.v_proj(self.norm_kv(concepts)).view(B, N, H, hd).transpose(1, 2)
+        kv = self.norm_kv(concepts)
+        k = self.k_proj(kv).view(B, N, H, hd).transpose(1, 2)
+        v = self.v_proj(kv).view(B, N, H, hd).transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout_p if self.training else 0.0,
+        )
 
-        out = attn @ v
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         out = self.out_proj(out)
 
         return tokens + out
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(d_model))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * norm * self.weight

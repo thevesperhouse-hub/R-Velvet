@@ -12,16 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(d_model))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * norm * self.weight
+from ._norm import RMSNorm
 
 
 class HaltingUnit(nn.Module):
@@ -94,9 +85,9 @@ def compute_halting_loss(p_halts: list, lambda_p: float = 0.5) -> torch.Tensor:
     halt_dist = halt_dist.clamp(min=eps)
     halt_dist = halt_dist / halt_dist.sum(dim=1, keepdim=True)
 
-    geometric = torch.zeros(N, device=device)
-    for i in range(N):
-        geometric[i] = lambda_p * ((1.0 - lambda_p) ** i)
+    # Geometric prior: p(i) = lambda_p * (1 - lambda_p)^i, vectorized.
+    idx = torch.arange(N, device=device, dtype=halt_dist.dtype)
+    geometric = lambda_p * (1.0 - lambda_p) ** idx
     geometric = geometric / geometric.sum()
     geometric = geometric.unsqueeze(0).expand(B, -1)
 

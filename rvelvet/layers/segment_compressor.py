@@ -1,12 +1,17 @@
 """
 Learned compression via cross-attention. Learned query vectors attend to segment tokens,
 forcing the model to extract salient information through the bottleneck.
+
+Uses torch.nn.functional.scaled_dot_product_attention when weights aren't
+needed; falls back to manual matmul+softmax when callers pass return_weights=True
+(e.g. visualisation tests).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+
+from ._norm import RMSNorm
 
 
 class SegmentCompressor(nn.Module):
@@ -74,6 +79,7 @@ class SegmentCompressor(nn.Module):
             concepts, w = layer(
                 queries=concepts,
                 keys_values=segments,
+                need_weights=return_weights,
             )
             if return_weights:
                 all_weights.append(w)
@@ -131,12 +137,13 @@ class CompressorCrossAttention(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout_p = dropout
 
     def forward(
         self,
         queries: torch.Tensor,
         keys_values: torch.Tensor,
+        need_weights: bool = False,
     ) -> tuple:
         B, S, K, D = queries.shape
         _, _, W, _ = keys_values.shape
@@ -150,12 +157,21 @@ class CompressorCrossAttention(nn.Module):
         k = self.k_proj(kv_in).view(B, S, W, H, hd).permute(0, 1, 3, 2, 4)
         v = self.v_proj(kv_in).view(B, S, W, H, hd).permute(0, 1, 3, 2, 4)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        weights = attn
-        attn = self.dropout(attn)
+        if need_weights:
+            # Manual path — keeps softmax weights for callers that want them.
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = F.softmax(attn, dim=-1)
+            weights = attn
+            if self.training and self.dropout_p > 0:
+                attn = F.dropout(attn, p=self.dropout_p)
+            out = attn @ v
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout_p if self.training else 0.0,
+            )
+            weights = None
 
-        out = attn @ v
         out = out.permute(0, 1, 3, 2, 4).contiguous().view(B, S, K, D)
         out = self.out_proj(out)
 
@@ -305,12 +321,3 @@ class AdaptiveSegmentCompressor(nn.Module):
         return output
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, d_model: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(d_model))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return x * norm * self.weight
