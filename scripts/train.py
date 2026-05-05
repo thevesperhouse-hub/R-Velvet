@@ -171,6 +171,265 @@ def prompt_target_size(default: str = "1.3B") -> str:
     return raw
 
 
+# ----------------------------------------------------------------------
+# Interactive wizard
+# ----------------------------------------------------------------------
+def _ask(prompt: str, default=None, parser=None, validate=None):
+    """Prompt with a default. Returns the parsed/validated value."""
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        raw = input(f"{prompt}{suffix}: ").strip()
+        if not raw:
+            if default is None:
+                print("  (required)")
+                continue
+            raw = str(default)
+        try:
+            val = parser(raw) if parser else raw
+            if validate:
+                validate(val)
+            return val
+        except (ValueError, AssertionError) as e:
+            print(f"  invalid: {e}")
+
+
+def _ask_yn(prompt: str, default: bool = True) -> bool:
+    d = "Y/n" if default else "y/N"
+    while True:
+        raw = input(f"{prompt} [{d}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in ("y", "yes", "o", "oui"):
+            return True
+        if raw in ("n", "no", "non"):
+            return False
+        print("  answer y or n")
+
+
+def _ask_choice(prompt: str, choices, default=None):
+    """Numbered choice selector. Returns the chosen value."""
+    print(f"\n{prompt}")
+    default_idx = None
+    for i, c in enumerate(choices, 1):
+        marker = ""
+        if c == default:
+            marker = " (default)"
+            default_idx = i
+        print(f"  [{i}] {c}{marker}")
+    while True:
+        raw = input(f"Choice [{default_idx}]: ").strip()
+        if not raw and default_idx is not None:
+            return choices[default_idx - 1]
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(choices):
+                return choices[idx - 1]
+        except ValueError:
+            pass
+        print(f"  enter a number between 1 and {len(choices)}")
+
+
+def _smart_batch_defaults(params: int) -> dict:
+    """Per-step batch defaults based on model size, calibrated for ~80GB GPU.
+
+    Conservative — user can scale up on bigger hardware. Effective batch
+    targets ~256-512 sequences via gradient accumulation.
+    """
+    if params <= 500_000_000:
+        return {"batch_size": 16, "seq_len": 2048, "grad_accum": 2}
+    if params <= 2_000_000_000:
+        return {"batch_size": 8, "seq_len": 4096, "grad_accum": 4}
+    if params <= 5_000_000_000:
+        return {"batch_size": 4, "seq_len": 4096, "grad_accum": 8}
+    return {"batch_size": 2, "seq_len": 4096, "grad_accum": 16}
+
+
+# Token-to-param ratios with explanatory labels.
+_RATIO_PRESETS = [
+    (20,   "Chinchilla 20:1 (compute-optimal, under-trained for inference)"),
+    (100,  "LLaMA-1 era ~100:1 (balanced)"),
+    (500,  "Modern conservative ~500:1 (good final quality)"),
+    (1000, "TinyLlama-style ~1000:1 (over-trained, cheaper inference)"),
+    (3000, "Heavy over-training ~3000:1 (maximum quality, big budget)"),
+]
+
+
+def _list_data_configs(config_dir: str = "configs") -> list:
+    return sorted([p.stem for p in Path(config_dir, "data").glob("*.yaml")])
+
+
+def run_wizard(phase: str, debug: bool, config_dir: str = "configs") -> dict:
+    """Full interactive setup. Returns a dict with everything needed to
+    configure the run:
+        {
+            "model_dict": dict,           # auto-sized model config
+            "data_name": str,             # e.g. 'fineweb2_fr'
+            "training_overrides": dict,   # to merge into training cfg
+            "resume_path": str | None,
+        }
+    """
+    print()
+    print("=" * 64)
+    print("  R-VELVET TRAINING WIZARD")
+    print(f"  Phase: {phase}")
+    print("=" * 64)
+    print("Press Enter to accept the default in [brackets].")
+
+    # 1. Target size + vocab
+    print("\n--- Model size ---")
+    target = _ask("Target parameter budget (e.g. 350M, 1.3B, 2.5B, 7B)",
+                  default="1.3B", parser=lambda s: s,
+                  validate=lambda s: parse_size(s))
+    target_params = parse_size(target)
+    vocab = _ask("Vocab size", default=64000, parser=int,
+                 validate=lambda v: (_ for _ in ()).throw(
+                     ValueError("vocab must be > 1000")) if v < 1000 else None)
+
+    # 2. Data config (need it before sizing for max_seq_len)
+    print("\n--- Data ---")
+    data_choices = _list_data_configs(config_dir)
+    if not data_choices:
+        raise SystemExit("No configs/data/*.yaml found")
+    default_data = "fineweb2_fr" if "fineweb2_fr" in data_choices else data_choices[0]
+    data_name = _ask_choice("Pick a data config:", data_choices, default=default_data)
+    data_yaml = load_yaml(os.path.join(config_dir, "data", f"{data_name}.yaml"))
+    yaml_seq_len = data_yaml.get("seq_len", 2048)
+
+    # 3. Sequence length (model.max_seq_len follows this)
+    print("\n--- Sequence length ---")
+    seq_len = _ask(f"Training sequence length (default from {data_name}.yaml)",
+                   default=yaml_seq_len, parser=int,
+                   validate=lambda v: (_ for _ in ()).throw(
+                       ValueError("seq_len must be > 64")) if v < 64 else None)
+
+    # 4. Auto-size and show the result
+    print("\n--- Auto-sizing ---")
+    sized = auto_size(target, vocab_size=vocab, max_seq_len=seq_len)
+    print(sized.pretty())
+    mem = estimate_memory(sized.params)
+    print()
+    print(f"  Static memory (bf16+AdamW, no activations):")
+    print(f"    weights:        {_fmt_gb(mem['weights'])}")
+    print(f"    grads:          {_fmt_gb(mem['grads'])}")
+    print(f"    optimizer:      {_fmt_gb(mem['optim'])}")
+    print(f"    total:          {_fmt_gb(mem['total'])}")
+    if not _ask_yn("\nProceed with this config?", default=True):
+        sys.exit(0)
+
+    # 5. Batch / grad_accum (smart defaults from model size)
+    print("\n--- Batch & gradient accumulation ---")
+    defaults = _smart_batch_defaults(sized.params)
+    print(f"  Recommended for {format_size(sized.params)}: "
+          f"bs={defaults['batch_size']}, grad_accum={defaults['grad_accum']} "
+          f"(effective batch = {defaults['batch_size'] * defaults['grad_accum']})")
+    batch_size = _ask("Per-step batch size", default=defaults["batch_size"],
+                      parser=int)
+    grad_accum = _ask("Gradient accumulation steps", default=defaults["grad_accum"],
+                      parser=int)
+
+    # 6. Token ratio + max_steps
+    print("\n--- Token budget ---")
+    print("  Token-to-param ratio drives how long you train:")
+    for r, label in _RATIO_PRESETS:
+        print(f"    {r:>5}:1  {label}")
+    print(f"    custom    Enter a custom ratio")
+    while True:
+        raw = input(f"Ratio [500]: ").strip() or "500"
+        if raw.lower() == "custom":
+            ratio = _ask("  Custom ratio (tokens per param)", default=500, parser=int)
+            break
+        try:
+            ratio = int(raw)
+            break
+        except ValueError:
+            print("  enter a number or 'custom'")
+
+    target_tokens = sized.params * ratio
+    tokens_per_step = batch_size * seq_len * grad_accum
+    suggested_steps = max(100, target_tokens // tokens_per_step)
+    print()
+    print(f"  Target tokens:    {target_tokens:>15,}  ({ratio}:1 ratio)")
+    print(f"  Tokens per step:  {tokens_per_step:>15,}  "
+          f"({batch_size} x {seq_len} x {grad_accum})")
+    print(f"  Suggested steps:  {suggested_steps:>15,}")
+    max_steps = _ask("Max training steps (override or accept)",
+                     default=int(suggested_steps), parser=int,
+                     validate=lambda v: (_ for _ in ()).throw(
+                         ValueError("steps must be > 0")) if v <= 0 else None)
+
+    # 7. Wandb
+    print("\n--- Logging ---")
+    use_wandb = _ask_yn("Enable wandb logging?", default=False)
+    wandb_project = "r-velvet"
+    wandb_run = phase
+    if use_wandb:
+        wandb_project = _ask("Wandb project name", default="rvelvet-runs",
+                             parser=lambda s: s)
+        wandb_run = _ask("Wandb run name",
+                         default=f"{phase}_{format_size(sized.params)}",
+                         parser=lambda s: s)
+
+    # 8. Resume
+    print("\n--- Resume ---")
+    resume_path = None
+    if _ask_yn("Resume from a checkpoint?", default=False):
+        resume_path = _ask("Checkpoint path",
+                           default="outputs/phase1_pretrain/ckpt_final.pt",
+                           parser=lambda s: s)
+
+    # 9. Build training overrides + summary
+    overrides = {
+        "batch_size": batch_size,
+        "grad_accum_steps": grad_accum,
+        "max_steps": max_steps,
+        "wandb": use_wandb,
+        "wandb_project": wandb_project,
+        "wandb_run": wandb_run,
+    }
+    if resume_path:
+        overrides["resume_from"] = resume_path
+
+    # Also override seq_len in data config if user changed it
+    data_overrides = {}
+    if seq_len != yaml_seq_len:
+        data_overrides["seq_len"] = seq_len
+
+    print()
+    print("=" * 64)
+    print("  SUMMARY")
+    print("=" * 64)
+    print(f"  Phase:              {phase}")
+    print(f"  Target / actual:    {target} / {format_size(sized.params)} "
+          f"({sized.error_pct:+.1f}%)")
+    print(f"  d_model:            {sized.config['d_model']:,}")
+    print(f"  Layers (loc/glob):  {sized.config['n_local_layers']} / "
+          f"{sized.config['n_global_layers']}")
+    print(f"  Vocab:              {vocab:,}")
+    print(f"  Seq len:            {seq_len:,}")
+    print(f"  Data config:        {data_name}")
+    print(f"  Batch / accum:      {batch_size} x {grad_accum} "
+          f"(effective {batch_size * grad_accum})")
+    print(f"  Max steps:          {max_steps:,}")
+    print(f"  Total tokens:       {max_steps * tokens_per_step:,} "
+          f"(~{(max_steps * tokens_per_step) / sized.params:.0f}:1 ratio)")
+    print(f"  Wandb:              {'on' if use_wandb else 'off'}"
+          + (f" ({wandb_project}/{wandb_run})" if use_wandb else ""))
+    print(f"  Resume:             {resume_path or 'no'}")
+    print(f"  Debug mode:         {debug}")
+    print("=" * 64)
+    if not _ask_yn("Launch training?", default=True):
+        sys.exit(0)
+    print()
+
+    return {
+        "model_dict": sized.config,
+        "data_name": data_name,
+        "training_overrides": overrides,
+        "data_overrides": data_overrides,
+        "resume_path": resume_path,
+    }
+
+
 def apply_overrides(cfg: Config, overrides: list):
     """Apply dotted key=value overrides like 'training.lr=1e-4'."""
     for override in overrides:
@@ -270,28 +529,36 @@ def main():
         print("Error: --model and --target-size are mutually exclusive.")
         sys.exit(2)
 
-    # Resolve model spec: explicit preset, target-size flag, or interactive.
+    # Resolve model spec: explicit preset, target-size flag, or wizard.
     auto_dict = None
+    wizard_result = None
+    data_name = args.data
+
     if args.target_size:
-        # Need max_seq_len from the data config — peek at it before building.
-        data_yaml = load_yaml(os.path.join("configs", "data", f"{args.data}.yaml"))
+        data_yaml = load_yaml(os.path.join("configs", "data", f"{data_name}.yaml"))
         max_seq_len = data_yaml.get("seq_len", 8192)
         auto_dict = auto_size_from_target(
             args.target_size, vocab_size=args.vocab_size, max_seq_len=max_seq_len,
         )
     elif args.model is None:
-        # Interactive prompt — only fires when running on a TTY without args.
+        # Full interactive wizard — only fires on a TTY without an explicit
+        # model spec. Walks the user through size, data, batch, ratio, steps,
+        # wandb, resume in one shot.
         if not sys.stdin.isatty():
             print("Error: no --model or --target-size given and stdin is not a TTY.")
             sys.exit(2)
-        chosen = prompt_target_size()
-        data_yaml = load_yaml(os.path.join("configs", "data", f"{args.data}.yaml"))
-        max_seq_len = data_yaml.get("seq_len", 8192)
-        auto_dict = auto_size_from_target(
-            chosen, vocab_size=args.vocab_size, max_seq_len=max_seq_len,
-        )
+        wizard_result = run_wizard(args.phase, debug=args.debug)
+        auto_dict = wizard_result["model_dict"]
+        data_name = wizard_result["data_name"]
 
-    cfg = load_config(args.phase, args.model, data=args.data, model_dict=auto_dict)
+    cfg = load_config(args.phase, args.model, data=data_name, model_dict=auto_dict)
+
+    # Apply wizard overrides (after YAML load, before --set / explicit flags).
+    if wizard_result:
+        for k, v in wizard_result["training_overrides"].items():
+            cfg.training[k] = v
+        for k, v in wizard_result["data_overrides"].items():
+            cfg.data[k] = v
 
     # Optionally persist the auto-sized config so it can be re-used as a preset.
     if args.save_auto_config and auto_dict is not None:
