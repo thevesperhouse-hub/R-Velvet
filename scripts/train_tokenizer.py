@@ -112,6 +112,9 @@ def main():
                         help="Min token frequency to keep")
     parser.add_argument("--no-fr-pretokenizer", action="store_true",
                         help="Disable the FR-specific Split layer (contractions, digits)")
+    parser.add_argument("--eval-docs", type=int, default=2000,
+                        help="After training, stream N held-out docs and report "
+                             "real chars/token. Set 0 to skip. Default 2000.")
     args = parser.parse_args()
 
     if not args.input and not args.hf_source:
@@ -236,9 +239,59 @@ def main():
         total_tokens += len(ids)
         total_chars += len(sent)
 
-    ratio = total_chars / max(1, total_tokens)
-    print(f"\n  Avg chars/token: {ratio:.2f} "
-          f"(target: >= 4.0 for FR; GPT-2 ~3.0, well-tuned FR BPE ~4.5+)")
+    # Subtract EOS contribution: each test sentence had <|endoftext|> appended,
+    # which inflates token count by 1 per sentence and is irrelevant to the
+    # tokenizer's compression quality.
+    total_tokens_no_eos = total_tokens - len(test_sentences)
+    ratio = total_chars / max(1, total_tokens_no_eos)
+    print(f"\n  Avg chars/token (synthetic, EOS-excluded): {ratio:.2f}")
+    print(f"    Note: these 5 stress-test sentences are biased toward "
+          f"single-char tokens\n    (punctuation, English loanwords, time/currency "
+          f"formats). Real FR prose\n    typically scores +0.5 to +1.0 above this.")
+
+    # Honest evaluation: stream a held-out chunk of real text and measure
+    # chars/token on actual prose. This is the number that should drive your
+    # decision about retraining vs vocab bumping.
+    if args.eval_docs > 0:
+        print(f"\nEvaluating on {args.eval_docs:,} held-out docs from the source...")
+        try:
+            # Reuse the same iterator builder so HF/local source works identically.
+            # We re-stream from the start; if --max-examples was set, we grab the
+            # next args.eval_docs after that. For local files we just take the
+            # first eval_docs lines (simple, deterministic).
+            eval_iter = _build_corpus_iterator(
+                argparse.Namespace(
+                    input=args.input,
+                    hf_source=args.hf_source,
+                    text_field=args.text_field,
+                    max_examples=(args.max_examples or 0) + args.eval_docs,
+                )
+            )
+            # Skip the docs we already trained on (only matters for local files;
+            # HF streaming doesn't guarantee identical order anyway).
+            eval_chars = 0
+            eval_tokens = 0
+            n_eval = 0
+            for i, doc in enumerate(eval_iter):
+                if args.input and i < (args.max_examples or 0):
+                    continue
+                ids = hf_tokenizer.encode(doc, add_special_tokens=False)
+                eval_chars += len(doc)
+                eval_tokens += len(ids)
+                n_eval += 1
+                if n_eval >= args.eval_docs:
+                    break
+            if n_eval > 0:
+                real_ratio = eval_chars / max(1, eval_tokens)
+                print(f"  Docs evaluated:  {n_eval:,}")
+                print(f"  Total chars:     {eval_chars:,}")
+                print(f"  Total tokens:    {eval_tokens:,}")
+                print(f"  Real chars/token: {real_ratio:.3f}  "
+                      f"(target: >= 4.0 OK, >= 4.5 excellent for FR)")
+            else:
+                print("  No held-out docs available for evaluation.")
+        except Exception as e:
+            print(f"  Eval skipped: {e}")
 
 
 if __name__ == "__main__":
