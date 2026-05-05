@@ -327,7 +327,16 @@ def run_wizard(phase: str, debug: bool, config_dir: str = "configs") -> dict:
     grad_accum = _ask("Gradient accumulation steps", default=defaults["grad_accum"],
                       parser=int)
 
-    # 6. Token ratio + max_steps
+    # 6. Optimizer choice
+    print("\n--- Optimizer ---")
+    print("  velvet : AdamW + PGM (Perplexity-Guided Momentum) + LVS (Loss-Velocity")
+    print("           Scaling). Auto-adapts beta1 and LR from loss dynamics. Best on")
+    print("           long pretraining runs (>10k steps).")
+    print("  adamw  : Vanilla PyTorch AdamW. Predictable, no adaptive heuristics. Use")
+    print("           for short debug runs or as a baseline.")
+    optimizer = _ask_choice("Optimizer:", ["velvet", "adamw"], default="velvet")
+
+    # 7. Token ratio + max_steps
     print("\n--- Token budget ---")
     print("  Token-to-param ratio drives how long you train:")
     for r, label in _RATIO_PRESETS:
@@ -357,7 +366,7 @@ def run_wizard(phase: str, debug: bool, config_dir: str = "configs") -> dict:
                      validate=lambda v: (_ for _ in ()).throw(
                          ValueError("steps must be > 0")) if v <= 0 else None)
 
-    # 7. Wandb
+    # 8. Wandb
     print("\n--- Logging ---")
     use_wandb = _ask_yn("Enable wandb logging?", default=False)
     wandb_project = "r-velvet"
@@ -369,7 +378,7 @@ def run_wizard(phase: str, debug: bool, config_dir: str = "configs") -> dict:
                          default=f"{phase}_{format_size(sized.params)}",
                          parser=lambda s: s)
 
-    # 8. Resume
+    # 9. Resume
     print("\n--- Resume ---")
     resume_path = None
     if _ask_yn("Resume from a checkpoint?", default=False):
@@ -377,11 +386,12 @@ def run_wizard(phase: str, debug: bool, config_dir: str = "configs") -> dict:
                            default="outputs/phase1_pretrain/ckpt_final.pt",
                            parser=lambda s: s)
 
-    # 9. Build training overrides + summary
+    # 10. Build training overrides + summary
     overrides = {
         "batch_size": batch_size,
         "grad_accum_steps": grad_accum,
         "max_steps": max_steps,
+        "optimizer": optimizer,
         "wandb": use_wandb,
         "wandb_project": wandb_project,
         "wandb_run": wandb_run,
@@ -409,6 +419,7 @@ def run_wizard(phase: str, debug: bool, config_dir: str = "configs") -> dict:
     print(f"  Data config:        {data_name}")
     print(f"  Batch / accum:      {batch_size} x {grad_accum} "
           f"(effective {batch_size * grad_accum})")
+    print(f"  Optimizer:          {optimizer}")
     print(f"  Max steps:          {max_steps:,}")
     print(f"  Total tokens:       {max_steps * tokens_per_step:,} "
           f"(~{(max_steps * tokens_per_step) / sized.params:.0f}:1 ratio)")
