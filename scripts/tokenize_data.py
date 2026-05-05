@@ -1,24 +1,34 @@
 """
-Tokenize raw text into a binary .bin file (uint16) for training.
+Tokenize raw text into a binary .bin file for training.
 
-Supports both HuggingFace model names (e.g. "gpt2") and local tokenizer
-directories (e.g. "data/tokenizer_fr" produced by train_tokenizer.py).
+Picks the smallest dtype that can hold all token ids:
+    vocab ≤ 65535 → uint16 (2 bytes/token)
+    vocab > 65535 → uint32 (4 bytes/token)
+
+A sidecar `<output>.meta.json` records the dtype + vocab so TextDataset can
+read the file unambiguously. Older .bin files without sidecar are still
+readable as uint16.
 
 Usage:
-    # With custom French tokenizer
-    python scripts/tokenize_data.py --input data/corpus_fr.txt --output data/train.bin --tokenizer data/tokenizer_fr
+    # With custom French tokenizer (any vocab size)
+    python scripts/tokenize_data.py --input data/corpus_fr.txt --output data/train.bin --tokenizer data/velvet_tok
 
     # With HuggingFace tokenizer
     python scripts/tokenize_data.py --input data/corpus_fr.txt --output data/train.bin --tokenizer gpt2
-
-    # Validation set
-    python scripts/tokenize_data.py --input data/val_fr.txt --output data/val.bin --tokenizer data/tokenizer_fr
 """
 
 import argparse
-import numpy as np
+import os
+import sys
 from pathlib import Path
+
+import numpy as np
 from tqdm import tqdm
+
+# Make the rvelvet package importable when running from the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from rvelvet.utils.dtypes import bin_dtype_for_vocab, write_bin_meta
 
 
 def load_tokenizer(name_or_path: str):
@@ -35,7 +45,7 @@ def load_tokenizer(name_or_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tokenize raw text → .bin (uint16)")
+    parser = argparse.ArgumentParser(description="Tokenize raw text → .bin")
     parser.add_argument("--input", type=str, required=True, help="Input text file")
     parser.add_argument("--output", type=str, required=True, help="Output .bin file")
     parser.add_argument("--tokenizer", type=str, default="data/velvet_tok", help="Tokenizer name or local path")
@@ -44,13 +54,9 @@ def main():
 
     tokenizer = load_tokenizer(args.tokenizer)
     vocab_size = tokenizer.vocab_size
-    print(f"  vocab_size={vocab_size}")
-
-    if vocab_size > 65535:
-        raise ValueError(
-            f"Vocab size {vocab_size} exceeds uint16 max (65535). "
-            "Use a smaller tokenizer or switch to uint32."
-        )
+    dtype = bin_dtype_for_vocab(vocab_size)
+    print(f"  vocab_size={vocab_size:,} → dtype={dtype.name} "
+          f"({dtype.itemsize} bytes/token)")
 
     print(f"Counting lines in {args.input}...")
     n_lines = 0
@@ -72,7 +78,7 @@ def main():
             if len(chunk_lines) >= args.chunk_size:
                 text = "".join(chunk_lines)
                 ids = tokenizer.encode(text)
-                arr = np.array(ids, dtype=np.uint16)
+                arr = np.array(ids, dtype=dtype)
                 arr.tofile(f_out)
                 total_tokens += len(ids)
                 chunk_lines = []
@@ -80,12 +86,17 @@ def main():
         if chunk_lines:
             text = "".join(chunk_lines)
             ids = tokenizer.encode(text)
-            arr = np.array(ids, dtype=np.uint16)
+            arr = np.array(ids, dtype=dtype)
             arr.tofile(f_out)
             total_tokens += len(ids)
 
+    meta_path = write_bin_meta(
+        args.output, vocab_size=vocab_size, n_tokens=total_tokens,
+        tokenizer=str(args.tokenizer),
+    )
     size_mb = Path(args.output).stat().st_size / (1024 * 1024)
     print(f"\nDone: {total_tokens:,} tokens → {args.output} ({size_mb:.1f} MB)")
+    print(f"  Sidecar: {meta_path}")
 
 
 if __name__ == "__main__":

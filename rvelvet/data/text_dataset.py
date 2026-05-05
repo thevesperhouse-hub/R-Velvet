@@ -1,7 +1,11 @@
 """
 Memory-mapped text dataset for language model training.
 
-Reads a tokenized .bin file (uint16 via np.memmap) with zero RAM overhead.
+Reads a tokenized .bin file via np.memmap with zero RAM overhead. The dtype
+(uint16 or uint32) is read from a sidecar `<bin>.meta.json` written by
+`scripts/tokenize_data.py`. Files without a sidecar default to uint16 so
+older runs keep working unchanged.
+
 Returns input_ids and targets (shifted by 1 position).
 """
 
@@ -9,18 +13,19 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from ..utils.dtypes import read_bin_meta
+
 
 class TextDataset(Dataset):
     """
     Memory-mapped dataset over a pre-tokenized .bin file.
 
-    The .bin file is a flat array of uint16 token IDs produced by
-    scripts/tokenize_data.py.
-
     Args:
-        data_path: Path to the .bin file
-        seq_len: Sequence length per sample
-        stride: Step between consecutive samples (default = seq_len, no overlap)
+        data_path: Path to the .bin file. Sidecar `<path>.meta.json` is
+            consulted to determine the dtype (uint16 vs uint32). If the
+            sidecar is missing, uint16 is assumed for backward compatibility.
+        seq_len: Sequence length per sample.
+        stride: Step between consecutive samples (default = seq_len, no overlap).
     """
 
     def __init__(self, data_path: str, seq_len: int = 2048, stride: int = None):
@@ -28,7 +33,11 @@ class TextDataset(Dataset):
         self.seq_len = seq_len
         self.stride = stride or seq_len
 
-        self.data = np.memmap(data_path, dtype=np.uint16, mode='r')
+        meta = read_bin_meta(data_path)
+        self.dtype = np.dtype(meta.get("dtype", "uint16"))
+        self.vocab_size = meta.get("vocab_size")  # may be None for legacy files
+
+        self.data = np.memmap(data_path, dtype=self.dtype, mode='r')
         self.n_tokens = len(self.data)
 
         if self.n_tokens < seq_len + 1:
