@@ -8,6 +8,7 @@ Uses torch.nn.functional.scaled_dot_product_attention for the attention core
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from ._norm import RMSNorm
 
