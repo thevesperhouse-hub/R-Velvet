@@ -146,13 +146,14 @@ class Trainer:
             csv_headers += ['beta1', 'lvs_scale', 'signal', 'pgm_scale', 'grad_norm', 'lvs_phase']
         csv_writer.writerow(csv_headers)
 
+        is_iterable = isinstance(self.train_dataset, torch.utils.data.IterableDataset)
         loader = DataLoader(
             self.train_dataset,
-            batch_size=tcfg.batch_size,
-            shuffle=True,
+            batch_size=tcfg.batch_size if not is_iterable else None,
+            shuffle=not is_iterable,
             num_workers=getattr(self.cfg.data, 'num_workers', 0),
             pin_memory=True,
-            drop_last=True,
+            drop_last=not is_iterable,
         )
 
         if tcfg.wandb and not tcfg.debug:
