@@ -31,6 +31,7 @@ from copy import deepcopy
 
 from rvelvet.model import RVelvet
 from rvelvet.data.text_dataset import TextDataset
+from rvelvet.data.streaming_dataset import StreamingTextDataset
 from rvelvet.training.trainer import Trainer
 
 
@@ -79,11 +80,11 @@ def _coerce_numerics(obj):
     return obj
 
 
-def load_config(phase: str, model: str, config_dir: str = "configs") -> Config:
+def load_config(phase: str, model: str, data: str = "text", config_dir: str = "configs") -> Config:
     """Load and merge YAML configs into a single Config object."""
     model_cfg = load_yaml(os.path.join(config_dir, "model", f"{model}.yaml"))
     training_cfg = load_yaml(os.path.join(config_dir, "training", f"{phase}.yaml"))
-    data_cfg = load_yaml(os.path.join(config_dir, "data", "text.yaml"))
+    data_cfg = load_yaml(os.path.join(config_dir, "data", f"{data}.yaml"))
 
     merged = {
         'model': model_cfg,
@@ -170,13 +171,15 @@ def main():
                         help="Model config name")
     parser.add_argument("--resume", type=str, default=None,
                         help="Checkpoint path to resume from")
+    parser.add_argument("--data", type=str, default="text",
+                        help="Data config name (under configs/data/)")
     parser.add_argument("--debug", action="store_true",
                         help="Debug mode: 10 steps, synthetic data")
     parser.add_argument("--set", nargs="*", default=[],
                         help="Override config values: key=value")
     args = parser.parse_args()
 
-    cfg = load_config(args.phase, args.model)
+    cfg = load_config(args.phase, args.model, data=args.data)
 
     if args.resume:
         cfg.training.resume_from = args.resume
@@ -220,6 +223,17 @@ def main():
         np.random.randint(0, cfg.model.vocab_size, size=n_tokens).astype(np.uint16).tofile(str(debug_path))
         dataset = TextDataset(str(debug_path), seq_len=cfg.data.seq_len)
         print(f"\nDebug dataset: {len(dataset)} samples ({n_tokens:,} random tokens)")
+    elif hasattr(cfg.data, 'sources'):
+        dataset = StreamingTextDataset(
+            sources=cfg.data.sources,
+            tokenizer_name_or_path=cfg.data.tokenizer,
+            seq_len=cfg.data.seq_len,
+            shuffle_buffer=getattr(cfg.data, 'shuffle_buffer', 1000),
+            max_doc_tokens=getattr(cfg.data, 'max_doc_tokens', 65536),
+            stopping_strategy=getattr(cfg.data, 'stopping_strategy', 'all_exhausted'),
+            eos_token_id=getattr(cfg.data, 'eos_token_id', None),
+        )
+        print(f"\nStreaming dataset: {len(cfg.data.sources)} source(s)")
     else:
         dataset = TextDataset(
             cfg.data.train_path,
