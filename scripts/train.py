@@ -275,17 +275,7 @@ def run_wizard(phase: str, debug: bool, config_dir: str = "configs") -> dict:
     print("=" * 64)
     print("Press Enter to accept the default in [brackets].")
 
-    # 1. Target size + vocab
-    print("\n--- Model size ---")
-    target = _ask("Target parameter budget (e.g. 350M, 1.3B, 2.5B, 7B)",
-                  default="1.3B", parser=lambda s: s,
-                  validate=lambda s: parse_size(s))
-    target_params = parse_size(target)
-    vocab = _ask("Vocab size", default=64000, parser=int,
-                 validate=lambda v: (_ for _ in ()).throw(
-                     ValueError("vocab must be > 1000")) if v < 1000 else None)
-
-    # 2. Data config (need it before sizing for max_seq_len)
+    # 1. Data config first (need tokenizer for vocab default + seq_len)
     print("\n--- Data ---")
     data_choices = _list_data_configs(config_dir)
     if not data_choices:
@@ -294,6 +284,26 @@ def run_wizard(phase: str, debug: bool, config_dir: str = "configs") -> dict:
     data_name = _ask_choice("Pick a data config:", data_choices, default=default_data)
     data_yaml = load_yaml(os.path.join(config_dir, "data", f"{data_name}.yaml"))
     yaml_seq_len = data_yaml.get("seq_len", 2048)
+
+    # Auto-detect vocab from tokenizer in data config
+    default_vocab = 64000
+    tok_path = data_yaml.get("tokenizer")
+    if tok_path:
+        try:
+            from transformers import AutoTokenizer
+            default_vocab = AutoTokenizer.from_pretrained(tok_path).vocab_size
+        except Exception:
+            pass
+
+    # 2. Target size + vocab
+    print("\n--- Model size ---")
+    target = _ask("Target parameter budget (e.g. 350M, 1.3B, 2.5B, 7B)",
+                  default="1.3B", parser=lambda s: s,
+                  validate=lambda s: parse_size(s))
+    target_params = parse_size(target)
+    vocab = _ask("Vocab size", default=default_vocab, parser=int,
+                 validate=lambda v: (_ for _ in ()).throw(
+                     ValueError("vocab must be > 1000")) if v < 1000 else None)
 
     # 3. Sequence length (model.max_seq_len follows this)
     print("\n--- Sequence length ---")
@@ -523,9 +533,9 @@ def main():
     parser.add_argument("--target-size", type=str, default=None,
                         help="Auto-size to a parameter budget (e.g. '1.3B'). "
                              "Bypasses --model and computes dims on the fly.")
-    parser.add_argument("--vocab-size", type=int, default=64000,
-                        help="Vocab size used for auto-sizing (default 64000). "
-                             "Ignored when --model is given.")
+    parser.add_argument("--vocab-size", type=int, default=None,
+                        help="Vocab size for auto-sizing. Auto-detected from "
+                             "tokenizer if not set.")
     parser.add_argument("--save-auto-config", type=str, default=None,
                         help="If set, write the auto-sized model dict to this "
                              "YAML path (under configs/model/) for reuse.")
@@ -556,13 +566,15 @@ def main():
         # Auto-detect vocab_size from the tokenizer if not explicitly set.
         vocab_size = args.vocab_size
         tok_path = data_yaml.get("tokenizer")
-        if tok_path and vocab_size == 64000:
+        if vocab_size is None and tok_path:
             try:
                 from transformers import AutoTokenizer
                 vocab_size = AutoTokenizer.from_pretrained(tok_path).vocab_size
                 print(f"Auto-detected vocab_size={vocab_size:,} from {tok_path}")
             except Exception:
-                pass
+                vocab_size = 64000
+        elif vocab_size is None:
+            vocab_size = 64000
         auto_dict = auto_size_from_target(
             args.target_size, vocab_size=vocab_size, max_seq_len=max_seq_len,
         )

@@ -5,7 +5,7 @@
 seq_len: 2048
 stride: null
 tokenizer: data/velvet_tok_100k_unigram
-num_workers: 2
+num_workers: 0
 prefetch_factor: 2
 shuffle_buffer: 1000
 max_doc_tokens: 65536
