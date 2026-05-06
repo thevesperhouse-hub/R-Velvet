@@ -323,9 +323,13 @@ def run_wizard(phase: str, debug: bool, config_dir: str = "configs") -> dict:
           f"bs={defaults['batch_size']}, grad_accum={defaults['grad_accum']} "
           f"(effective batch = {defaults['batch_size'] * defaults['grad_accum']})")
     batch_size = _ask("Per-step batch size", default=defaults["batch_size"],
-                      parser=int)
+                      parser=int,
+                      validate=lambda v: (_ for _ in ()).throw(
+                          ValueError("batch_size must be > 0")) if v <= 0 else None)
     grad_accum = _ask("Gradient accumulation steps", default=defaults["grad_accum"],
-                      parser=int)
+                      parser=int,
+                      validate=lambda v: (_ for _ in ()).throw(
+                          ValueError("grad_accum must be > 0")) if v <= 0 else None)
 
     # 6. Optimizer choice
     print("\n--- Optimizer ---")
