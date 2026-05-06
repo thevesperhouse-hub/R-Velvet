@@ -473,7 +473,7 @@ class Trainer:
                                 log_dict['lvs_confidence'] = self.optimizer.lvs_confidence
                                 log_dict['grad_norm'] = self.optimizer.last_grad_norm
                                 log_dict['skipped_window'] = skipped_window
-                            wandb.log(log_dict)
+                            wandb.log(log_dict, step=self.global_step)
                         except Exception as e:
                             print(f"WARNING: wandb.log failed: {e}")
 
