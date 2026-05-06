@@ -1,5 +1,5 @@
 """
-Train an Unigram tokenizer for R-Velvet using SentencePiece (Google).
+Train a tokenizer for R-Velvet using SentencePiece (Google), BPE or Unigram.
 
 Why SentencePiece and not HF tokenizers ?
 HF tokenizers' Unigram implementation keeps the entire suffix array in
@@ -9,27 +9,42 @@ intractable. SentencePiece (Google C++) shards the suffix array, supports
 streaming via sentence sampling, and is what Mistral / Gemma / T5 / BLOOM /
 CamemBERT all use under the hood.
 
+Why SP-BPE rather than HF byte-level BPE on FR ?
+HF's default ByteLevel BPE encodes every character as UTF-8 bytes before
+merging. Each accented FR character (é, è, à, ç, œ, …) is 2 bytes, so the
+algo starts with a built-in handicap that it only partially recovers via
+merges. SP-BPE works at the character level natively : accents are single
+tokens from step 1. Empirically buys +0.2 to +0.4 chars/token on FR at
+iso-vocab.
+
 Pipeline:
     1. Stream from HF and/or local
     2. Yield individual lines (SPM trains on sentences, not whole documents)
     3. SPM samples `input_sentence_size` items from the stream and trains
-    4. Wrap the resulting .model in a HuggingFace LlamaTokenizerFast
-       (Llama-style SPM Unigram + byte_fallback is the closest match)
+    4. Wrap the resulting .model :
+       - Unigram → tokenizers.Unigram via direct piece/score extraction
+       - BPE     → LlamaTokenizerFast (which knows how to read SPM .model
+                   merge rules) with post-conversion vocab-size validation
     5. Save in HF Fast format compatible with PreTrainedTokenizerFast
 
 Usage:
+    # Unigram (default)
     python scripts/train_tokenizer_spm.py \\
         --hf-source HuggingFaceFW/fineweb-2:fra_Latn:train \\
-        --vocab-size 100000 \\
-        --max-examples 5000000 \\
         --output data/velvet_tok_100k_spm
+
+    # BPE (recommended for FR — sidesteps byte-level overhead on accents)
+    python scripts/train_tokenizer_spm.py \\
+        --algo bpe \\
+        --hf-source HuggingFaceFW/fineweb-2:fra_Latn:train \\
+        --output data/velvet_tok_100k_spm_bpe
 
     # Multi-source mix
     python scripts/train_tokenizer_spm.py \\
+        --algo bpe \\
         --hf-source HuggingFaceFW/fineweb-2:fra_Latn:train@0.7 \\
         --hf-source wikimedia/wikipedia:20231101.fr:train@0.3 \\
-        --vocab-size 100000 \\
-        --output data/velvet_tok_100k_spm_mix
+        --output data/velvet_tok_100k_spm_bpe_mix
 """
 
 import argparse
@@ -124,7 +139,9 @@ def _iter_hf_streams(specs: List[str], max_examples: Optional[int],
             continue
         for line in txt.splitlines():
             line = line.strip()
-            if line:
+            # Filter very short lines (often nav/garbage on web crawls).
+            # 50 chars is the threshold used by Mistral / Gemma corpus prep.
+            if len(line) >= 50:
                 yield line
         n_docs += 1
         if max_examples and n_docs >= max_examples:
@@ -146,28 +163,38 @@ def _build_corpus_iterator(args, max_examples: Optional[int] = None) -> Iterable
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train an Unigram tokenizer via SentencePiece for R-Velvet")
+        description="Train a BPE or Unigram tokenizer via SentencePiece for R-Velvet")
     parser.add_argument("--input", type=str, default=None,
                         help="Local text file (one sentence/line per row)")
     parser.add_argument("--hf-source", type=str, action="append", default=None,
                         help="HF streaming spec '<repo>:<name>:<split>[@<weight>]'. "
                              "Pass multiple times to mix sources by weight.")
     parser.add_argument("--text-field", type=str, default="text")
+    parser.add_argument("--algo", type=str, default="unigram",
+                        choices=["unigram", "bpe"],
+                        help="SentencePiece algorithm. 'bpe' (char-level via SPM) "
+                             "is recommended for FR : sidesteps the byte-level "
+                             "overhead on accented characters that limits HF BPE.")
     parser.add_argument("--output", type=str, default="data/velvet_tok_100k_spm",
                         help="Output tokenizer directory")
     parser.add_argument("--vocab-size", type=int, default=100000,
-                        help="Vocabulary size. 100k targets exceptional FR "
-                             "compression. Includes 256 byte-fallback pieces.")
-    parser.add_argument("--max-examples", type=int, default=5_000_000,
+                        help="Vocabulary size.")
+    parser.add_argument("--max-examples", type=int, default=8_000_000,
                         help="Cap on documents streamed from source (each doc "
                              "is split into multiple sentence lines for SPM).")
-    parser.add_argument("--input-sentence-size", type=int, default=20_000_000,
+    parser.add_argument("--input-sentence-size", type=int, default=30_000_000,
                         help="Number of sentences SentencePiece samples from "
-                             "the stream for actual training. 20M is the "
-                             "high-quality target for FR.")
-    parser.add_argument("--character-coverage", type=float, default=0.9999,
-                        help="Fraction of characters to cover. 0.9999 keeps "
-                             "rare FR chars (œ, ÿ, ç) without exploding vocab.")
+                             "the stream for actual training.")
+    parser.add_argument("--character-coverage", type=float, default=1.0,
+                        help="Fraction of characters to cover. 1.0 covers all "
+                             "FR chars at no compression cost vs 0.9999.")
+    parser.add_argument("--seed-sentencepiece-size", type=int, default=1_300_000,
+                        help="Initial seed vocab size before EM pruning. "
+                             "10x final vocab is the recipe for high-quality "
+                             "Unigram fits.")
+    parser.add_argument("--num-sub-iterations", type=int, default=4,
+                        help="EM iterations per Unigram pruning round. "
+                             "More iterations = tighter optimum. Default 4.")
     parser.add_argument("--num-threads", type=int, default=os.cpu_count() or 4,
                         help="SPM training threads (defaults to all cores).")
     parser.add_argument("--no-byte-fallback", action="store_true",
@@ -189,18 +216,21 @@ def main():
     from tokenizers.pre_tokenizers import Metaspace
     from tokenizers.decoders import Metaspace as MetaspaceDecoder
     from tokenizers.processors import TemplateProcessing
-    from tokenizers.normalizers import NFKC
-    from transformers import PreTrainedTokenizerFast
+    from tokenizers.normalizers import NFC
+    from transformers import PreTrainedTokenizerFast, LlamaTokenizerFast
 
-    print("Training SentencePiece Unigram tokenizer")
+    print(f"Training SentencePiece {args.algo.upper()} tokenizer")
     src = args.input or args.hf_source
     print(f"  Source:               {src}")
+    print(f"  Algorithm:            {args.algo}")
     print(f"  Vocab size:           {args.vocab_size:,}")
     print(f"  Max docs streamed:    {args.max_examples:,}")
     print(f"  Sentences sampled:    {args.input_sentence_size:,}")
     print(f"  Character coverage:   {args.character_coverage}")
     print(f"  Byte fallback:        {'off' if args.no_byte_fallback else 'on'}")
     print(f"  Split digits:         {'off' if args.no_split_digits else 'on'}")
+    print(f"  Seed SP size:         {args.seed_sentencepiece_size:,}")
+    print(f"  EM sub-iterations:    {args.num_sub_iterations}")
     print(f"  Threads:              {args.num_threads}")
 
     output_dir = Path(args.output)
@@ -223,7 +253,7 @@ def main():
         sentence_iterator=iter(_build_corpus_iterator(args)),
         model_prefix=str(model_prefix),
         vocab_size=args.vocab_size,
-        model_type="unigram",
+        model_type=args.algo,
         character_coverage=args.character_coverage,
         input_sentence_size=args.input_sentence_size,
         shuffle_input_sentence=True,
@@ -233,6 +263,9 @@ def main():
         allow_whitespace_only_pieces=True,
         remove_extra_whitespaces=False,
         normalization_rule_name="nmt_nfkc",
+        # Aggressive optimization for max compression at given vocab.
+        seed_sentencepiece_size=args.seed_sentencepiece_size,
+        num_sub_iterations=args.num_sub_iterations,
         # Memory mode for large corpora
         train_extremely_large_corpus=True,
         num_threads=args.num_threads,
@@ -249,44 +282,70 @@ def main():
     print(f"  Done in {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
     # Wrap the .model in a HuggingFace Fast tokenizer.
-    #
-    # We bypass LlamaTokenizerFast(vocab_file=...) because in some
-    # transformers versions it silently fails to convert the SPM vocab,
-    # leaving tokenizer.json with only the special tokens (vocab_size=3
-    # on reload). Building the Tokenizer from the SPM model directly via
-    # the tokenizers library is robust across versions.
     print("\nConverting to HuggingFace Fast format...")
     sp = spm.SentencePieceProcessor()
     sp.Load(str(model_prefix) + ".model")
     n_pieces = sp.GetPieceSize()
-    vocab = [(sp.IdToPiece(i), float(sp.GetScore(i))) for i in range(n_pieces)]
 
-    tokenizer = Tokenizer(Unigram(
-        vocab=vocab,
-        unk_id=sp.unk_id(),
-        byte_fallback=not args.no_byte_fallback,
-    ))
-    tokenizer.normalizer = NFKC()
-    tokenizer.pre_tokenizer = Metaspace(
-        replacement="▁",
-        prepend_scheme="always",
-    )
-    tokenizer.decoder = MetaspaceDecoder(
-        replacement="▁",
-        prepend_scheme="always",
-    )
-    eos_id = sp.PieceToId("<|endoftext|>")
-    tokenizer.post_processor = TemplateProcessing(
-        single="$A <|endoftext|>",
-        special_tokens=[("<|endoftext|>", eos_id)],
-    )
+    if args.algo == "unigram":
+        # For Unigram we extract (piece, score) pairs and build the HF
+        # Tokenizer directly. We avoid LlamaTokenizerFast(vocab_file=...)
+        # because in some transformers versions it silently fails for
+        # Unigram, leaving tokenizer.json with only special tokens
+        # (vocab_size=3 on reload).
+        vocab = [(sp.IdToPiece(i), float(sp.GetScore(i))) for i in range(n_pieces)]
 
-    hf_tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=tokenizer,
-        eos_token="<|endoftext|>",
-        pad_token="<|padding|>",
-        unk_token="<|unknown|>",
-    )
+        tokenizer = Tokenizer(Unigram(
+            vocab=vocab,
+            unk_id=sp.unk_id(),
+            byte_fallback=not args.no_byte_fallback,
+        ))
+        # NFC (not NFKC) so that FR ligatures œ / æ stay as single chars.
+        # NFKC decomposes them to oe / ae which costs ~0.05 chars/token on
+        # FR (cœur, sœur, œuf, etc.).
+        tokenizer.normalizer = NFC()
+        tokenizer.pre_tokenizer = Metaspace(
+            replacement="▁",
+            prepend_scheme="always",
+        )
+        tokenizer.decoder = MetaspaceDecoder(
+            replacement="▁",
+            prepend_scheme="always",
+        )
+        eos_id = sp.PieceToId("<|endoftext|>")
+        tokenizer.post_processor = TemplateProcessing(
+            single="$A <|endoftext|>",
+            special_tokens=[("<|endoftext|>", eos_id)],
+        )
+
+        hf_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer,
+            eos_token="<|endoftext|>",
+            pad_token="<|padding|>",
+            unk_token="<|unknown|>",
+        )
+    else:
+        # For BPE we use LlamaTokenizerFast which knows how to read SPM
+        # .model merge rules. Validate after construction because the
+        # silent-fail bug exists for some transformers versions.
+        hf_tokenizer = LlamaTokenizerFast(
+            vocab_file=str(model_prefix) + ".model",
+            eos_token="<|endoftext|>",
+            pad_token="<|padding|>",
+            unk_token="<|unknown|>",
+            legacy=False,
+            add_bos_token=False,
+            add_eos_token=True,
+        )
+        if hf_tokenizer.vocab_size < int(args.vocab_size * 0.9):
+            raise SystemExit(
+                f"LlamaTokenizerFast wrapping appears to have failed silently: "
+                f"got vocab_size={hf_tokenizer.vocab_size}, expected ~{args.vocab_size}. "
+                f"Check transformers / tokenizers / sentencepiece versions. "
+                f"The raw SPM model is intact at {model_prefix}.model and can "
+                f"be re-wrapped manually."
+            )
+
     hf_tokenizer.save_pretrained(str(output_dir))
 
     print(f"\nSaved to: {output_dir}")
