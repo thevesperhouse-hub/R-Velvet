@@ -7,7 +7,7 @@
 
 seq_len: 2048
 stride: null
-tokenizer: data/velvet_tok
+tokenizer: data/velvet_tok_100k_unigram
 num_workers: 4
 prefetch_factor: 4
 shuffle_buffer: 20000

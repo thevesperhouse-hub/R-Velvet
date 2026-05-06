@@ -48,7 +48,7 @@ def main():
     parser = argparse.ArgumentParser(description="Tokenize raw text → .bin")
     parser.add_argument("--input", type=str, required=True, help="Input text file")
     parser.add_argument("--output", type=str, required=True, help="Output .bin file")
-    parser.add_argument("--tokenizer", type=str, default="data/velvet_tok", help="Tokenizer name or local path")
+    parser.add_argument("--tokenizer", type=str, default="data/velvet_tok_100k_unigram", help="Tokenizer name or local path")
     parser.add_argument("--chunk_size", type=int, default=10000, help="Lines per chunk")
     args = parser.parse_args()
 

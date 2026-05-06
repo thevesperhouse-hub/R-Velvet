@@ -3,5 +3,5 @@ train_path: data/train.bin
 val_path: data/val.bin
 seq_len: 2048
 stride: null              # null = seq_len (no overlap)
-tokenizer: data/velvet_tok      # local BPE tokenizer (or HuggingFace name)
+tokenizer: data/velvet_tok_100k_unigram   # FR Unigram, 100k vocab, 4.84 c/t
 num_workers: 4

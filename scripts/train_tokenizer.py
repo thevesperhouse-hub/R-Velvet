@@ -166,6 +166,17 @@ def main():
                         help="Min token frequency to keep (BPE only)")
     parser.add_argument("--no-fr-pretokenizer", action="store_true",
                         help="(BPE only) Disable the FR-specific Split layer")
+    parser.add_argument("--n-sub-iterations", type=int, default=2,
+                        help="(Unigram only) EM sub-iterations. Default 2, "
+                             "try 4 for slightly better vocab convergence.")
+    parser.add_argument("--shrinking-factor", type=float, default=0.75,
+                        help="(Unigram only) Fraction of vocab kept per "
+                             "iteration. Default 0.75, try 0.7 for more "
+                             "aggressive pruning.")
+    parser.add_argument("--max-piece-length", type=int, default=16,
+                        help="(Unigram only) Max piece length. Default 16. "
+                             "Lower reduces suffix-array memory at compression "
+                             "cost; do not change unless trainer hangs.")
     parser.add_argument("--eval-docs", type=int, default=2000,
                         help="After training, stream N held-out docs and report "
                              "real chars/token. Set 0 to skip. Default 2000.")
@@ -214,6 +225,9 @@ def main():
             special_tokens=special_tokens,
             unk_token="<|unknown|>",
             show_progress=True,
+            n_sub_iterations=args.n_sub_iterations,
+            shrinking_factor=args.shrinking_factor,
+            max_piece_length=args.max_piece_length,
         )
     else:
         # FR-aware byte-level BPE.
