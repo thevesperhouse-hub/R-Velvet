@@ -212,12 +212,17 @@ def main():
     # Local imports — keep --help fast.
     import sentencepiece as spm
     from tokenizers import Tokenizer
-    from tokenizers.models import Unigram
+    from tokenizers.models import Unigram, BPE
     from tokenizers.pre_tokenizers import Metaspace
     from tokenizers.decoders import Metaspace as MetaspaceDecoder
     from tokenizers.processors import TemplateProcessing
     from tokenizers.normalizers import NFC
-    from transformers import PreTrainedTokenizerFast, LlamaTokenizerFast
+    from transformers import PreTrainedTokenizerFast
+
+    # Reuse the SPM-BPE merge extractor so wrap-on-train and the rescue
+    # script (spm_to_hf.py) stay byte-identical.
+    sys.path.insert(0, str(Path(__file__).parent))
+    from spm_to_hf import _extract_bpe_vocab_and_merges
 
     print(f"Training SentencePiece {args.algo.upper()} tokenizer")
     src = args.input or args.hf_source
@@ -287,65 +292,62 @@ def main():
     sp.Load(str(model_prefix) + ".model")
     n_pieces = sp.GetPieceSize()
 
-    if args.algo == "unigram":
-        # For Unigram we extract (piece, score) pairs and build the HF
-        # Tokenizer directly. We avoid LlamaTokenizerFast(vocab_file=...)
-        # because in some transformers versions it silently fails for
-        # Unigram, leaving tokenizer.json with only special tokens
-        # (vocab_size=3 on reload).
-        vocab = [(sp.IdToPiece(i), float(sp.GetScore(i))) for i in range(n_pieces)]
+    byte_fallback = not args.no_byte_fallback
 
+    if args.algo == "unigram":
+        # Extract (piece, score) pairs and build HF Unigram directly.
+        vocab = [(sp.IdToPiece(i), float(sp.GetScore(i))) for i in range(n_pieces)]
         tokenizer = Tokenizer(Unigram(
             vocab=vocab,
             unk_id=sp.unk_id(),
-            byte_fallback=not args.no_byte_fallback,
+            byte_fallback=byte_fallback,
         ))
-        # NFC (not NFKC) so that FR ligatures œ / æ stay as single chars.
-        # NFKC decomposes them to oe / ae which costs ~0.05 chars/token on
-        # FR (cœur, sœur, œuf, etc.).
-        tokenizer.normalizer = NFC()
-        tokenizer.pre_tokenizer = Metaspace(
-            replacement="▁",
-            prepend_scheme="always",
-        )
-        tokenizer.decoder = MetaspaceDecoder(
-            replacement="▁",
-            prepend_scheme="always",
-        )
-        eos_id = sp.PieceToId("<|endoftext|>")
-        tokenizer.post_processor = TemplateProcessing(
-            single="$A <|endoftext|>",
-            special_tokens=[("<|endoftext|>", eos_id)],
-        )
-
-        hf_tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=tokenizer,
-            eos_token="<|endoftext|>",
-            pad_token="<|padding|>",
-            unk_token="<|unknown|>",
-        )
     else:
-        # For BPE we use LlamaTokenizerFast which knows how to read SPM
-        # .model merge rules. Validate after construction because the
-        # silent-fail bug exists for some transformers versions.
-        hf_tokenizer = LlamaTokenizerFast(
-            vocab_file=str(model_prefix) + ".model",
-            eos_token="<|endoftext|>",
-            pad_token="<|padding|>",
+        # Extract merges from SPM-BPE protobuf and build HF BPE directly.
+        # We don't go through LlamaTokenizerFast(vocab_file=...) because it
+        # silently fails (vocab_size=3 on reload) for some transformers /
+        # sentencepiece version combinations.
+        print("  Extracting BPE merges from SPM model...")
+        vocab_dict, merges = _extract_bpe_vocab_and_merges(sp)
+        print(f"  Extracted {len(merges):,} merges across {len(vocab_dict):,} pieces")
+        tokenizer = Tokenizer(BPE(
+            vocab=vocab_dict,
+            merges=merges,
             unk_token="<|unknown|>",
-            legacy=False,
-            add_bos_token=False,
-            add_eos_token=True,
-        )
-        if hf_tokenizer.vocab_size < int(args.vocab_size * 0.9):
-            raise SystemExit(
-                f"LlamaTokenizerFast wrapping appears to have failed silently: "
-                f"got vocab_size={hf_tokenizer.vocab_size}, expected ~{args.vocab_size}. "
-                f"Check transformers / tokenizers / sentencepiece versions. "
-                f"The raw SPM model is intact at {model_prefix}.model and can "
-                f"be re-wrapped manually."
-            )
+            byte_fallback=byte_fallback,
+            fuse_unk=True,
+        ))
 
+    # NFC (not NFKC) so FR ligatures œ / æ stay as single chars.
+    # NFKC decomposes them to oe / ae which costs ~0.05 chars/token on
+    # FR (cœur, sœur, œuf, etc.).
+    tokenizer.normalizer = NFC()
+    tokenizer.pre_tokenizer = Metaspace(
+        replacement="▁",
+        prepend_scheme="always",
+    )
+    tokenizer.decoder = MetaspaceDecoder(
+        replacement="▁",
+        prepend_scheme="always",
+    )
+    eos_id = sp.PieceToId("<|endoftext|>")
+    tokenizer.post_processor = TemplateProcessing(
+        single="$A <|endoftext|>",
+        special_tokens=[("<|endoftext|>", eos_id)],
+    )
+
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        eos_token="<|endoftext|>",
+        pad_token="<|padding|>",
+        unk_token="<|unknown|>",
+    )
+    if hf_tokenizer.vocab_size < int(args.vocab_size * 0.9):
+        raise SystemExit(
+            f"HF Fast wrapping failed: got vocab_size={hf_tokenizer.vocab_size}, "
+            f"expected ~{args.vocab_size}. Raw SPM model is intact at "
+            f"{model_prefix}.model and can be re-wrapped via spm_to_hf.py."
+        )
     hf_tokenizer.save_pretrained(str(output_dir))
 
     print(f"\nSaved to: {output_dir}")
