@@ -224,16 +224,18 @@ def main():
         dataset = TextDataset(str(debug_path), seq_len=cfg.data.seq_len)
         print(f"\nDebug dataset: {len(dataset)} samples ({n_tokens:,} random tokens)")
     elif hasattr(cfg.data, 'sources'):
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(cfg.data.tokenizer)
         dataset = StreamingTextDataset(
             sources=cfg.data.sources,
-            tokenizer_name_or_path=cfg.data.tokenizer,
+            tokenizer=tokenizer,
             seq_len=cfg.data.seq_len,
             shuffle_buffer=getattr(cfg.data, 'shuffle_buffer', 1000),
             max_doc_tokens=getattr(cfg.data, 'max_doc_tokens', 65536),
             stopping_strategy=getattr(cfg.data, 'stopping_strategy', 'all_exhausted'),
             eos_token_id=getattr(cfg.data, 'eos_token_id', None),
         )
-        print(f"\nStreaming dataset: {len(cfg.data.sources)} source(s)")
+        print(f"\nStreaming dataset: {len(cfg.data.sources)} source(s), tokenizer vocab={len(tokenizer)}")
     else:
         dataset = TextDataset(
             cfg.data.train_path,
