@@ -293,11 +293,12 @@ class Trainer:
             )
         loader = DataLoader(self.train_dataset, **loader_kwargs)
 
-        self._wandb_active = False
         if tcfg.wandb and not tcfg.debug:
-            import wandb
-            wandb.init(project=tcfg.wandb_project, name=tcfg.wandb_run)
-            self._wandb_active = True
+            try:
+                import wandb
+                wandb.init(project=tcfg.wandb_project, name=tcfg.wandb_run)
+            except Exception:
+                pass
 
         self.model.train()
         data_iter = iter(loader)
@@ -453,24 +454,24 @@ class Trainer:
                     csv_writer.writerow(csv_row)
                     csv_file.flush()
 
-                    if self._wandb_active:
-                        import wandb
-                        log_dict = {
-                            **avg_dict,
-                            'lr': lr_now,
-                            'ppl': ppl_val,
-                            'step': self.global_step,
-                            'tokens_per_sec': tok_per_s,
-                            'vram_gb': torch.cuda.memory_allocated() / (1024 ** 3),
-                            'vram_peak_gb': torch.cuda.max_memory_allocated() / (1024 ** 3),
-                        }
-                        if self.use_velvet:
-                            log_dict['effective_beta1'] = self.optimizer.effective_beta1
-                            log_dict['lvs_scale'] = self.optimizer.lr_scale
-                            log_dict['lvs_confidence'] = self.optimizer.lvs_confidence
-                            log_dict['grad_norm'] = self.optimizer.last_grad_norm
-                            log_dict['skipped_window'] = skipped_window
-                        wandb.log(log_dict)
+                    if tcfg.wandb and not tcfg.debug:
+                        try:
+                            import wandb
+                            log_dict = {
+                                **avg_dict,
+                                'lr': lr_now,
+                                'step': self.global_step,
+                                'tokens_per_sec': tok_per_s,
+                            }
+                            if self.use_velvet:
+                                log_dict['effective_beta1'] = self.optimizer.effective_beta1
+                                log_dict['lvs_scale'] = self.optimizer.lr_scale
+                                log_dict['lvs_confidence'] = self.optimizer.lvs_confidence
+                                log_dict['grad_norm'] = self.optimizer.last_grad_norm
+                                log_dict['skipped_window'] = skipped_window
+                            wandb.log(log_dict)
+                        except Exception:
+                            pass
 
                     accum_loss = 0.0
                     loss_dict_accum = {}
