@@ -149,11 +149,11 @@ class Trainer:
         is_iterable = isinstance(self.train_dataset, torch.utils.data.IterableDataset)
         loader = DataLoader(
             self.train_dataset,
-            batch_size=tcfg.batch_size if not is_iterable else None,
+            batch_size=tcfg.batch_size,
             shuffle=not is_iterable,
             num_workers=getattr(self.cfg.data, 'num_workers', 0),
             pin_memory=True,
-            drop_last=not is_iterable,
+            drop_last=True,
         )
 
         if tcfg.wandb and not tcfg.debug:
