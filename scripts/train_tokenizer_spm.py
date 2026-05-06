@@ -184,7 +184,13 @@ def main():
 
     # Local imports — keep --help fast.
     import sentencepiece as spm
-    from transformers import LlamaTokenizerFast, PreTrainedTokenizerFast
+    from tokenizers import Tokenizer
+    from tokenizers.models import Unigram
+    from tokenizers.pre_tokenizers import Metaspace
+    from tokenizers.decoders import Metaspace as MetaspaceDecoder
+    from tokenizers.processors import TemplateProcessing
+    from tokenizers.normalizers import NFKC
+    from transformers import PreTrainedTokenizerFast
 
     print("Training SentencePiece Unigram tokenizer")
     src = args.input or args.hf_source
@@ -243,16 +249,43 @@ def main():
     print(f"  Done in {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
     # Wrap the .model in a HuggingFace Fast tokenizer.
-    # LlamaTokenizerFast handles SPM Unigram + byte_fallback natively.
+    #
+    # We bypass LlamaTokenizerFast(vocab_file=...) because in some
+    # transformers versions it silently fails to convert the SPM vocab,
+    # leaving tokenizer.json with only the special tokens (vocab_size=3
+    # on reload). Building the Tokenizer from the SPM model directly via
+    # the tokenizers library is robust across versions.
     print("\nConverting to HuggingFace Fast format...")
-    hf_tokenizer = LlamaTokenizerFast(
-        vocab_file=str(model_prefix) + ".model",
+    sp = spm.SentencePieceProcessor()
+    sp.Load(str(model_prefix) + ".model")
+    n_pieces = sp.GetPieceSize()
+    vocab = [(sp.IdToPiece(i), float(sp.GetScore(i))) for i in range(n_pieces)]
+
+    tokenizer = Tokenizer(Unigram(
+        vocab=vocab,
+        unk_id=sp.unk_id(),
+        byte_fallback=not args.no_byte_fallback,
+    ))
+    tokenizer.normalizer = NFKC()
+    tokenizer.pre_tokenizer = Metaspace(
+        replacement="▁",
+        prepend_scheme="always",
+    )
+    tokenizer.decoder = MetaspaceDecoder(
+        replacement="▁",
+        prepend_scheme="always",
+    )
+    eos_id = sp.PieceToId("<|endoftext|>")
+    tokenizer.post_processor = TemplateProcessing(
+        single="$A <|endoftext|>",
+        special_tokens=[("<|endoftext|>", eos_id)],
+    )
+
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
         eos_token="<|endoftext|>",
         pad_token="<|padding|>",
         unk_token="<|unknown|>",
-        add_bos_token=False,
-        add_eos_token=True,  # auto-append EOS to encode() output
-        legacy=False,
     )
     hf_tokenizer.save_pretrained(str(output_dir))
 
