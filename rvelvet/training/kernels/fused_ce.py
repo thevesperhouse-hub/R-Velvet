@@ -1,148 +1,139 @@
-"""Fused Cross-Entropy — Triton kernel (Unsloth-style, single-launch).
+"""Fused Cross-Entropy — Triton kernel (Unsloth-style).
 
 Standard cross-entropy materializes the FULL [B*S, V] logits tensor in memory.
 For V=128K, batch=64, seq=512: that's 64*512*128K*4 = 17GB just for logits.
 
-This kernel computes cross-entropy chunked along the vocab dimension WITHIN a
-single kernel launch — never materializing the full softmax. Memory: O(B*S*chunk).
-
-Key wins vs. the chunk-per-launch baseline:
-- 1 forward + 1 backward kernel launch instead of 2*ceil(V/CHUNK) launches
-  (e.g. 32× fewer launches for V=128K)
-- max_logit / sum_exp stay in registers across chunks (no global memory transit)
-- grad_loss passed as scalar arg (no per-row pointer load)
-- use_lse constexpr: skips grad_lse path entirely when z-loss is unused
+This kernel computes cross-entropy in chunks along the vocab dimension,
+never materializing the full softmax. Memory: O(B*S*chunk) instead of O(B*S*V).
 
 Based on the technique from Unsloth (Daniel & Michael Han).
 """
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-# Chunk size for vocab processing — fits in SRAM (constexpr, power-of-2)
+# Chunk size for vocab processing — fits in SRAM
 VOCAB_CHUNK = 4096
 
 
 @triton.jit
 def _fused_ce_forward_kernel(
-    logits_ptr,      # [N, V] — N = B*S, can be BF16 / FP16 / F32
+    logits_ptr,      # [N, V] — N = B*S, can be BF16 or F32
     labels_ptr,      # [N]
-    loss_ptr,        # [N] — output: per-row loss (F32)
-    lse_ptr,         # [N] — output: per-row logsumexp (F32, for z-loss)
-    max_logit_ptr,   # [N] — output: saved for backward (F32)
-    sum_exp_ptr,     # [N] — output: saved for backward (F32)
-    V,
-    NUM_CHUNKS: tl.constexpr,
+    loss_ptr,        # [N] — per-token loss (F32)
+    max_logit_ptr,   # [N] — running max for numerical stability (F32)
+    sum_exp_ptr,     # [N] — running sum(exp) (F32)
+    V,               # vocab size
+    chunk_start,     # start index in vocab dim
     CHUNK_SIZE: tl.constexpr,
 ):
-    """One program per row. Internal loop over vocab chunks.
-
-    Online softmax: running max + sum_exp accumulate in registers across
-    iterations — never spilled to global memory until final store.
-    """
     row = tl.program_id(0).to(tl.int64)
     label = tl.load(labels_ptr + row).to(tl.int64)
 
-    # Single load of the correct logit (label is constant per row)
-    correct_logit = tl.load(logits_ptr + row * V + label).to(tl.float32)
-
-    # Online softmax accumulators (registers)
-    running_max = -float("inf")
-    running_sum = 0.0
-
+    # Load this chunk of logits (BF16 -> F32 per-chunk, no global copy)
     offs = tl.arange(0, CHUNK_SIZE).to(tl.int64)
-    for c in tl.range(NUM_CHUNKS):
-        chunk_start = c * CHUNK_SIZE
-        vocab_idx = chunk_start + offs
-        mask = vocab_idx < V
+    vocab_idx = chunk_start + offs
+    mask = vocab_idx < V
 
-        logit_ptrs = logits_ptr + row * V + vocab_idx
-        logits = tl.load(
-            logit_ptrs, mask=mask, other=-float("inf"),
-            eviction_policy='evict_first',
-        ).to(tl.float32)
+    logit_ptrs = logits_ptr + row * V + vocab_idx
+    logits = tl.load(logit_ptrs, mask=mask, other=-float("inf")).to(tl.float32)
 
-        chunk_max = tl.max(logits, axis=0)
-        new_max = tl.maximum(running_max, chunk_max)
-        # Rescale previous sum to new_max basis, then add chunk's exp-sum
-        rescaled_prev = running_sum * tl.exp(running_max - new_max)
-        chunk_sum = tl.sum(tl.exp(logits - new_max), axis=0)
-        running_sum = rescaled_prev + chunk_sum
-        running_max = new_max
+    # Update running max
+    chunk_max = tl.max(logits, axis=0)
+    prev_max = tl.load(max_logit_ptr + row)
+    new_max = tl.maximum(prev_max, chunk_max)
 
-    # Finalize: lse = max + log(sum), loss = -correct_logit + lse
-    lse_val = running_max + tl.log(running_sum)
-    loss_val = -correct_logit + lse_val
+    # Rescale previous sum_exp and add this chunk
+    prev_sum = tl.load(sum_exp_ptr + row)
+    rescaled_prev = prev_sum * tl.exp(prev_max - new_max)
+    chunk_sum = tl.sum(tl.exp(logits - new_max), axis=0)
+    new_sum = rescaled_prev + chunk_sum
 
-    tl.store(loss_ptr + row, loss_val)
-    tl.store(lse_ptr + row, lse_val)
-    tl.store(max_logit_ptr + row, running_max)
-    tl.store(sum_exp_ptr + row, running_sum)
+    tl.store(max_logit_ptr + row, new_max)
+    tl.store(sum_exp_ptr + row, new_sum)
+
+    # If the correct label falls in this chunk, store the logit
+    in_chunk = (label >= chunk_start) & (label < chunk_start + CHUNK_SIZE)
+    if in_chunk:
+        correct_logit = tl.load(logits_ptr + row * V + label).to(tl.float32)
+        tl.store(loss_ptr + row, correct_logit)
+
+
+@triton.jit
+def _fused_ce_finalize_kernel(
+    loss_ptr,        # [N] — contains correct_logit, will be overwritten with loss
+    lse_ptr,         # [N] — logsumexp output (for z-loss)
+    max_logit_ptr,   # [N]
+    sum_exp_ptr,     # [N]
+    N,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    mask = offs < N
+
+    correct_logit = tl.load(loss_ptr + offs, mask=mask)
+    max_logit = tl.load(max_logit_ptr + offs, mask=mask)
+    sum_exp = tl.load(sum_exp_ptr + offs, mask=mask)
+
+    # logsumexp = max + log(sum_exp)  — reused for z-loss
+    logsumexp = max_logit + tl.log(sum_exp)
+    # loss = -correct_logit + logsumexp
+    loss = -correct_logit + logsumexp
+    tl.store(loss_ptr + offs, loss, mask=mask)
+    tl.store(lse_ptr + offs, logsumexp, mask=mask)
 
 
 @triton.jit
 def _fused_ce_backward_kernel(
-    logits_ptr,       # [N, V] — read AND write (gradients in-place)
-    grad_logits_ptr,  # same as logits_ptr — separate ptr for clarity
+    logits_ptr,       # [N, V] — original logits (BF16 or F32)
+    grad_logits_ptr,  # [N, V] — output gradient (same dtype as logits)
     labels_ptr,       # [N]
-    max_logit_ptr,    # [N] from forward
-    sum_exp_ptr,      # [N] from forward
-    grad_lse_ptr,     # [N] — F32, only loaded if use_lse
-    grad_loss,        # scalar (F32) — passed by-value, no memory load
+    max_logit_ptr,    # [N] — from forward
+    sum_exp_ptr,      # [N] — from forward
+    grad_loss_ptr,    # [1] — upstream gradient for loss_mean (F32)
+    grad_lse_ptr,     # [N] — upstream gradient for lse (F32), zeros if unused
     V,
-    inv_N,            # 1.0 / N (scalar)
-    use_lse: tl.constexpr,
-    NUM_CHUNKS: tl.constexpr,
+    inv_N,            # 1.0 / N (float)
+    chunk_start,
     CHUNK_SIZE: tl.constexpr,
 ):
-    """One program per row. Internal loop over vocab chunks. Writes grads in-place."""
     row = tl.program_id(0).to(tl.int64)
     label = tl.load(labels_ptr + row).to(tl.int64)
-    max_val = tl.load(max_logit_ptr + row)
-    sum_val = tl.load(sum_exp_ptr + row)
-
-    if use_lse:
-        g_lse = tl.load(grad_lse_ptr + row)
-    else:
-        g_lse = 0.0
 
     offs = tl.arange(0, CHUNK_SIZE).to(tl.int64)
-    for c in tl.range(NUM_CHUNKS):
-        chunk_start = c * CHUNK_SIZE
-        vocab_idx = chunk_start + offs
-        mask = vocab_idx < V
+    vocab_idx = chunk_start + offs
+    mask = vocab_idx < V
 
-        logit_ptrs = logits_ptr + row * V + vocab_idx
-        logits = tl.load(
-            logit_ptrs, mask=mask, other=-float("inf"),
-            eviction_policy='evict_first',
-        ).to(tl.float32)
+    # Recompute softmax from saved max/sum_exp (no extra memory)
+    logit_ptrs = logits_ptr + row * V + vocab_idx
+    logits = tl.load(logit_ptrs, mask=mask, other=-float("inf")).to(tl.float32)
 
-        # Recompute softmax (no extra memory beyond saved max/sum)
-        softmax = tl.exp(logits - max_val) / sum_val
+    max_val = tl.load(max_logit_ptr + row)
+    sum_val = tl.load(sum_exp_ptr + row)
+    softmax = tl.exp(logits - max_val) / sum_val
 
-        # CE gradient: (softmax - one_hot) * grad_loss / N
-        is_label = (vocab_idx == label).to(tl.float32)
-        grad = (softmax - is_label) * grad_loss * inv_N
+    # CE gradient: (softmax - one_hot) * grad_loss / N
+    g_loss = tl.load(grad_loss_ptr)
+    is_label = (vocab_idx == label)
+    grad = (softmax - is_label.to(tl.float32)) * g_loss * inv_N
 
-        # LSE gradient: softmax * grad_lse  (z-loss backprop)
-        if use_lse:
-            grad = grad + softmax * g_lse
+    # LSE gradient: softmax * grad_lse[row]  (for z-loss backprop)
+    g_lse = tl.load(grad_lse_ptr + row)
+    grad = grad + softmax * g_lse
 
-        # In-place write to logits memory (auto-converts to native dtype)
-        grad_ptrs = grad_logits_ptr + row * V + vocab_idx
-        tl.store(grad_ptrs, grad, mask=mask, eviction_policy='evict_last')
+    # Store gradient (Triton handles F32 -> BF16 conversion if needed)
+    grad_ptrs = grad_logits_ptr + row * V + vocab_idx
+    tl.store(grad_ptrs, grad, mask=mask)
 
 
 class _FusedCEFunction(torch.autograd.Function):
-    """Autograd wrapper: makes (loss, lse) differentiable w.r.t. logits.
+    """Autograd wrapper for chunked fused cross-entropy Triton kernel.
 
-    The backward recomputes softmax per-chunk from saved (max, sum_exp) and
-    writes gradients in-place into the logits buffer — no [N, V] grad allocation.
-    Safe because each thread reads a chunk THEN writes the gradient at the same
-    address (no cross-row, no cross-chunk dependencies).
+    Makes loss and logsumexp differentiable w.r.t. logits so backward() works.
+    The backward recomputes softmax per-chunk from saved max/sum_exp — no extra
+    [N, V] memory beyond the required grad_logits output.
     """
 
     @staticmethod
@@ -150,24 +141,31 @@ class _FusedCEFunction(torch.autograd.Function):
         N, V = logits.shape
         device = logits.device
 
-        loss = torch.empty(N, device=device, dtype=torch.float32)
-        lse = torch.empty(N, device=device, dtype=torch.float32)
-        max_logit = torch.empty(N, device=device, dtype=torch.float32)
-        sum_exp = torch.empty(N, device=device, dtype=torch.float32)
+        loss = torch.zeros(N, device=device, dtype=torch.float32)
+        max_logit = torch.full((N,), -float("inf"), device=device, dtype=torch.float32)
+        sum_exp = torch.zeros(N, device=device, dtype=torch.float32)
+        lse = torch.zeros(N, device=device, dtype=torch.float32)
 
-        num_chunks = triton.cdiv(V, VOCAB_CHUNK)
+        for chunk_start in range(0, V, VOCAB_CHUNK):
+            chunk_size = min(VOCAB_CHUNK, V - chunk_start)
+            padded_chunk = triton.next_power_of_2(chunk_size)
+            _fused_ce_forward_kernel[(N,)](
+                logits, labels, loss, max_logit, sum_exp,
+                V, chunk_start,
+                CHUNK_SIZE=padded_chunk,
+            )
 
-        _fused_ce_forward_kernel[(N,)](
-            logits, labels, loss, lse, max_logit, sum_exp,
-            V,
-            NUM_CHUNKS=num_chunks, CHUNK_SIZE=VOCAB_CHUNK,
-            num_warps=8,
+        BLOCK = 1024
+        _fused_ce_finalize_kernel[(triton.cdiv(N, BLOCK),)](
+            loss, lse, max_logit, sum_exp, N, BLOCK=BLOCK,
         )
 
         loss_mean = loss.mean()
 
+        # Save labels/stats via save_for_backward; logits stored separately
+        # to allow in-place gradient write (avoids 8GB grad_logits allocation)
         ctx.save_for_backward(labels, max_logit, sum_exp)
-        ctx.logits = logits  # direct ref so backward can write in-place
+        ctx.logits = logits
         ctx.N = N
         ctx.V = V
 
@@ -179,34 +177,31 @@ class _FusedCEFunction(torch.autograd.Function):
         logits = ctx.logits
         N, V = ctx.N, ctx.V
 
-        # use_lse constexpr: skip the entire grad_lse path when not needed
-        if grad_lse is None:
-            use_lse = False
-            # Pass a 1-element tensor as a placeholder; kernel never loads it.
-            grad_lse_t = torch.empty(1, device=logits.device, dtype=torch.float32)
-        else:
-            use_lse = True
-            grad_lse_t = grad_lse.contiguous().to(torch.float32)
+        # In-place backward: overwrite logits with gradients (saves 8GB allocation).
+        # Safe because the backward kernel reads each chunk THEN writes the gradient
+        # to the same location — no cross-chunk or cross-row dependencies.
 
-        # grad_loss is a scalar tensor; convert to Python float (scalar kernel arg)
-        grad_loss_f = float(grad_loss.detach())
+        # If z-loss not used, grad_lse is None — use zeros
+        if grad_lse is None:
+            grad_lse = torch.zeros(N, device=logits.device, dtype=torch.float32)
+
+        # Ensure grad_loss is a contiguous F32 1-element tensor for Triton pointer load
+        grad_loss_t = grad_loss.detach().float().contiguous().view(1)
+
         inv_N = 1.0 / N
 
-        num_chunks = triton.cdiv(V, VOCAB_CHUNK)
+        for chunk_start in range(0, V, VOCAB_CHUNK):
+            chunk_size = min(VOCAB_CHUNK, V - chunk_start)
+            padded_chunk = triton.next_power_of_2(chunk_size)
+            _fused_ce_backward_kernel[(N,)](
+                logits, logits, labels,  # read AND write to same tensor
+                max_logit, sum_exp,
+                grad_loss_t, grad_lse,
+                V, inv_N, chunk_start,
+                CHUNK_SIZE=padded_chunk,
+            )
 
-        _fused_ce_backward_kernel[(N,)](
-            logits, logits, labels,        # read AND write in-place
-            max_logit, sum_exp,
-            grad_lse_t,
-            grad_loss_f,
-            V,
-            inv_N,
-            use_lse=use_lse,
-            NUM_CHUNKS=num_chunks, CHUNK_SIZE=VOCAB_CHUNK,
-            num_warps=8,
-        )
-
-        return logits, None  # logits buffer now holds gradients
+        return logits, None  # logits now contains gradients
 
 
 def fused_cross_entropy(
@@ -215,31 +210,29 @@ def fused_cross_entropy(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked fused cross-entropy — O(B*S*chunk) memory instead of O(B*S*V).
 
-    For V=128K, this saves ~17GB vs standard F.cross_entropy. Single-kernel
-    fusion eliminates per-chunk launch overhead.
-
-    Returns (loss, logsumexp). Both are differentiable w.r.t. logits.
-    Falls back to PyTorch when not on CUDA or for very small vocab where
-    cuBLAS-optimized softmax is faster.
+    For V=128K, this saves ~17GB vs standard F.cross_entropy.
+    Returns (loss, logsumexp) — logsumexp is per-token for z-loss computation.
+    Both outputs are differentiable w.r.t. logits.
+    Falls back to PyTorch if logits are small enough.
     """
+    orig_shape = logits.shape
     if logits.dim() == 3:
-        B, S, V = logits.shape
+        B, S, V = orig_shape
         logits = logits.reshape(B * S, V)
         labels = labels.reshape(B * S)
     else:
         N, V = logits.shape
 
-    # CPU / very small vocab: PyTorch path. F.cross_entropy handles bf16/fp16
-    # internally via f32 reductions — no need for an explicit .float() cast that
-    # would allocate a full [N, V] f32 buffer.
-    if not logits.is_cuda or V <= 1024:
-        loss = F.cross_entropy(logits, labels, reduction="mean")
-        # logsumexp on bf16/fp16 isn't numerically safe — upcast just the
-        # reduction dim (still cheap because it's a single reduction over V).
-        if logits.dtype in (torch.float16, torch.bfloat16):
-            lse = torch.logsumexp(logits.float(), dim=-1)
-        else:
-            lse = torch.logsumexp(logits, dim=-1)
+    N = logits.shape[0]
+
+    # For vocab <= 65536, just use PyTorch (faster, avoids Triton kernel issues)
+    if V <= 65536:
+        loss = torch.nn.functional.cross_entropy(
+            logits.float(), labels, reduction="mean"
+        )
+        # Compute logsumexp for z-loss (small vocab = cheap)
+        lse = torch.logsumexp(logits.float(), dim=-1)
         return loss, lse
 
+    # Chunked Triton kernel with autograd support for large vocab
     return _FusedCEFunction.apply(logits, labels)

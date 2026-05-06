@@ -37,18 +37,20 @@ __global__ void velvet_complete_kernel(
     // Decoupled weight decay (AdamW)
     p *= (1.0f - base_lr * wd);
 
-    // Classical Adam moment update (constant beta1) — bias-correction math preserved
-    m_val = beta1 * m_val + (1.0f - beta1) * g;
+    // PGM: adaptive beta1
+    float effective_beta1 = beta1;
+    if (perplexity_guided) {
+        effective_beta1 *= ppl_momentum_scale;
+        effective_beta1 = fminf(fmaxf(effective_beta1, 0.5f), 0.999f);
+    }
+
+    // Moments (PGM-adjusted beta1)
+    m_val = effective_beta1 * m_val + (1.0f - effective_beta1) * g;
     v_val = beta2 * v_val + (1.0f - beta2) * g * g;
 
-    // Bias-corrected
+    // Bias-corrected (base beta1)
     float m_hat = m_val / bias_correction1;
     float v_hat = v_val / bias_correction2;
-
-    // PGM: post-correction momentum scaling (no EMA drift)
-    if (perplexity_guided) {
-        m_hat *= ppl_momentum_scale;
-    }
 
     // LVS: adaptive LR
     float effective_lr = base_lr;

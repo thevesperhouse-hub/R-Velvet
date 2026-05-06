@@ -70,84 +70,17 @@ cd R-Velvet
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# Train a FR-tuned BPE tokenizer (default 64K vocab, FR-aware pre-tokenizer)
-python scripts/train_tokenizer.py --input corpus.txt --output data/velvet_tok_64k
+# Train BPE tokenizer (vocab size 32K)
+python scripts/train_tokenizer.py --input corpus.txt --output data/velvet_tok
 
-# Tokenize your corpus (adaptive uint16/uint32 — works for any vocab size)
-python scripts/tokenize_data.py --input corpus.txt --output data/train.bin --tokenizer data/velvet_tok_64k
+# Tokenize your corpus
+python scripts/tokenize_data.py --input corpus.txt --output data/train.bin --tokenizer data/velvet_tok
 
-# Launch the interactive wizard (asks size, data, ratio, steps, batch, wandb…)
-python scripts/train.py --phase phase1_pretrain
-
-# Or skip the wizard with explicit flags
-python scripts/train.py --phase phase1_pretrain --target-size 1.3B
+# Train base model
+python scripts/train.py training=phase1_pretrain model=base data=text
 ```
 
-For an end-to-end cloud launch guide (GPU choice, tokenizer prep, monitoring,
-phase chaining, common pitfalls), see [`RUNBOOK.md`](RUNBOOK.md).
-
-Training happens in three phases. Phase 1 pretrains the base model, Phase 2 enables ACR, Phase 3 adds iterative reasoning. Each phase resumes from the previous checkpoint with `--resume path/to/ckpt.pt`.
-
-## Auto-sizing & interactive wizard
-
-Pass a target parameter budget and R-Velvet derives the model dims for you. The sizer searches `(d_model, n_local_layers, n_global_layers)` on the meta device (no allocation), scoring candidates by both param-count error and aspect-ratio deviation from the LLaMA-2/3/Mistral family (`d_model / n_total_layers ≈ 110`). Lands within ~1.5% of the target.
-
-```bash
-# Auto-size to a target
-python scripts/train.py --phase phase1_pretrain --target-size 1.3B
-
-# Persist the auto-sized config for reuse as a preset
-python scripts/train.py --phase phase1_pretrain --target-size 2.5B --save-auto-config my_2_5b.yaml
-
-# Wizard: no flags → walks size, vocab, data, seq_len, batch, ratio, steps,
-# wandb, resume in one guided pass. Recommends batch defaults from model
-# size and computes max_steps from token budget / (batch × seq × grad_accum).
-python scripts/train.py --phase phase1_pretrain
-```
-
-The wizard explains token-to-param ratios inline (Chinchilla 20:1, modern 500:1, TinyLlama 1000:1) and shows a final summary with effective batch + total tokens before launching. See [`RUNBOOK.md`](RUNBOOK.md) for the full cloud-launch playbook.
-
-Sample output for `--target-size 1.3B --vocab-size 64000`:
-
-```
-Auto-sized config (target 1.30B):
-  d_model:          1,792
-  n_local_layers:   7
-  n_global_layers:  13   (total 20 transformer layers)
-  n_local_heads:    14   (head_dim=128)
-  Total params:     1.28B (target 1.30B, -1.3%)
-
-  Static memory (bf16+AdamW, no activations):
-    weights:        2.55 GB
-    grads:          2.55 GB
-    optimizer:      15.31 GB
-    total:          20.41 GB
-```
-
-Or use a YAML preset (`small`, `base`) with `--model base`. Override anything with `--set training.lr=1e-4 training.batch_size=16`.
-
-## French data pipeline
-
-For FR pretraining, two streaming corpora are wired up out of the box (no full download required — HF `interleave_datasets` with weighted sampling, EOS-separated cross-document packing, worker sharding):
-
-```bash
-# Phase 1/2: FineWeb-2 FR + Wikipedia FR + CulturaX + HAL + OSCAR + small code
-python scripts/train.py --phase phase1_pretrain --target-size 1.3B --data fineweb2_fr
-
-# Phase 3: reasoning mix (translated GSM8K/MATH + Wikipedia + anti-forgetting)
-python scripts/build_reasoning_fr.py --output data/reasoning_fr   # NLLB translation
-python scripts/train.py --phase phase3_iterative --target-size 1.3B --data reasoning_fr
-```
-
-The tokenizer trainer is FR-tuned: NFC normalization, Split layer that isolates apostrophe-contractions (`l'`, `d'`, `qu'`, `n'`) and individual digits, then byte-level BPE. Default vocab is 64k (sweet spot for 1.3B-2.5B FR). Larger vocabs (`--vocab-size 100000`) are supported transparently — `tokenize_data.py` switches to uint32 with a sidecar `<bin>.meta.json` so the dataset loader can pick the right dtype.
-
-```bash
-# Stream FineWeb-2 FR for tokenizer training (no disk corpus needed)
-python scripts/train_tokenizer.py \
-    --hf-source HuggingFaceFW/fineweb-2:fra_Latn:train \
-    --max-examples 5_000_000 \
-    --output data/velvet_tok_64k
-```
+Training happens in three phases. Phase 1 pretrains the base model, Phase 2 enables ACR, Phase 3 adds iterative reasoning. Each phase resumes from the previous checkpoint with `training.resume_from=path/to/ckpt.pt`.
 
 ## VelvetOptimizer
 
@@ -214,48 +147,37 @@ python scripts/plot_run.py outputs/phase1/metrics.csv outputs/adamw/metrics.csv 
 | `small` | 256 | 4 / 4 | 4 / 4 | ~5M | Debug, fast iteration |
 | `base` | 384 | 6 / 8 | 6 / 8 | ~50M | Production |
 
-Or skip presets entirely with `--target-size` (see [Auto-sizing](#auto-sizing) above). The sizer reproduces LLaMA-family shapes:
-
-| Target | d_model | Layers | Heads | Aspect | Sized |
-|---|---|---|---|---|---|
-| 350M  | 1024 | 14 | 8  | 73  | -1.4% |
-| 1.3B  | 1792 | 20 | 14 | 90  | -1.3% |
-| 2.5B  | 2304 | 25 | 18 | 92  | -0.1% |
-| 7B    | 3584 | 30 | 28 | 119 | -1.0% |
-
 Optional modes add minimal overhead: ACR adds ~0.7% params (scanner), iterative reasoning adds ~1.6% params (LoRA bank + halting unit).
 
 ## Training phases
 
-**Phase 1 — Base pretraining.** Standard LM training. All params trained with cross-entropy. LR 3e-4, cosine decay, 2K warmup. Modern token-to-param ratios (TinyLlama 2700:1, LLaMA-3.2-1B 9000:1) prefer one pass over a large unique-token corpus rather than the older Chinchilla 20:1 with multiple epochs.
+**Phase 1 — Base pretraining.** Standard LM training. All params trained with cross-entropy. LR 3e-4, cosine decay, 2K warmup. Takes ~100K steps on CulturaX to reach Chinchilla optimal (~20:1 tokens/params ratio).
 
-**Phase 2 — ACR finetuning.** Enables adaptive routing. Loads Phase 1 checkpoint with `strict=False` to add new modules. Base params get LR×0.1, ACR params get full LR. Loss is CE + load_balance + entropy + compute_cost.
+**Phase 2 — ACR finetuning.** Enables adaptive routing. Loads Phase 1 checkpoint with `strict=False` to add new modules. Base params get LR×0.1, ACR params get full LR. Loss is CE + load_balance + entropy + compute_cost. Takes ~50K steps.
 
-**Phase 3 — Iterative reasoning.** Freezes base model, only trains LoRA bank + halting unit + iteration embeddings. Loss is CE + halting + deep_supervision (each iteration's output gets supervised).
+**Phase 3 — Iterative reasoning.** Freezes base model, only trains LoRA bank + halting unit + iteration embeddings. Loss is CE + halting + deep_supervision (each iteration's output gets supervised). Takes ~30K steps.
 
-Each phase resumes from the previous: `--resume outputs/phase1_pretrain/ckpt_final.pt`
+Each phase resumes from the previous: `training.resume_from=outputs/phase1/ckpt_final.pt`
 
 ## Configuration
 
-YAML configs live in `configs/{model,training,data}/`. Override anything from the CLI:
+Hydra configs live in `configs/`. Override anything from CLI:
 
 ```bash
 # Smaller batch, longer run
-python scripts/train.py --phase phase1_pretrain --model base \
-    --set training.batch_size=16 training.max_steps=20000
+python scripts/train.py training=phase1_pretrain training.batch_size=16 training.max_steps=20000
 
 # Use small model for quick tests
-python scripts/train.py --phase phase1_pretrain --model small
+python scripts/train.py training=phase1_pretrain model=small
 
 # Enable wandb logging
-python scripts/train.py --phase phase1_pretrain --model base \
-    --set training.wandb=true training.wandb_project=my-project
+python scripts/train.py training=phase1_pretrain training.wandb=true training.wandb_project=my-project
 ```
 
-Debug mode runs a short loop on synthetic data:
+Debug mode runs 500 steps with 10-step logging:
 
 ```bash
-python scripts/train.py --phase phase1_pretrain --target-size 350M --debug
+python scripts/train.py training=phase1_pretrain training.debug=true
 ```
 
 ## Kernel backends
@@ -277,32 +199,27 @@ R-Velvet/
 ├── rvelvet/
 │   ├── model.py                     # Main model
 │   ├── layers/                      # All architecture components
-│   ├── data/
-│   │   ├── text_dataset.py          # Memory-mapped .bin loader (adaptive dtype)
-│   │   └── streaming_dataset.py     # HF streaming + interleave + packing
-│   ├── utils/
-│   │   ├── sizing.py                # Auto-sizing engine
-│   │   └── dtypes.py                # uint16/uint32 + sidecar metadata
+│   ├── data/                        # Dataset loaders
 │   └── training/
 │       ├── trainer.py               # Training loop
 │       ├── velvet_optimizer.py      # Custom optimizer
 │       └── kernels/                 # Triton/CUDA kernels
-├── configs/                         # YAML configs (model/training/data)
+├── configs/                         # Hydra configs
 ├── scripts/
-│   ├── train.py                     # Main entry point (--target-size aware)
-│   ├── train_tokenizer.py           # BPE training (FR-tuned, 64k default)
-│   ├── tokenize_data.py             # Corpus → .bin (adaptive dtype + sidecar)
-│   ├── build_reasoning_fr.py        # NLLB translation for GSM8K/MATH → FR
-│   └── plot_run.py                  # Visualize training
-└── tests/                           # 119 unit tests
+│   ├── train.py                     # Main entry point
+│   ├── train_tokenizer.py           # BPE training
+│   ├── tokenize_data.py             # Corpus → .bin
+│   ├── plot_run.py                  # Visualize training
+│   └── download_culturax.py         # Dataset downloader
+└── tests/                           # Unit tests
 ```
 
 ## Tests
 
 ```bash
-pytest tests/                        # full suite (119 tests)
-pytest tests/test_sizing.py -v       # auto-sizing + adaptive dtype
-pytest tests/test_optimizer.py -v    # 3-backend optimizer parity
+python tests/test_architecture.py     # Shapes, gradients, memory
+python tests/test_acr.py              # Routing, load balance
+python tests/test_iterative_reasoning.py  # LoRA, halting
 ```
 
 ## License

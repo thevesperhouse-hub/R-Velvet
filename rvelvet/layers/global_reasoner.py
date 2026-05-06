@@ -1,16 +1,11 @@
 """
 Full self-attention over concept vectors. Quadratic complexity is tractable due to compression.
-
-Uses torch.nn.functional.scaled_dot_product_attention for the attention core
-(Flash / mem-efficient backends auto-selected on supported GPUs).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
-
-from ._norm import RMSNorm
+import math
 
 
 class GlobalReasoner(nn.Module):
@@ -32,8 +27,6 @@ class GlobalReasoner(nn.Module):
         self.norm = RMSNorm(d_model)
 
         self.relevance_head = nn.Linear(d_model, 1, bias=False)
-        # Toggled by Trainer when cfg.training.gradient_checkpointing=True.
-        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -44,13 +37,7 @@ class GlobalReasoner(nn.Module):
     ) -> dict:
         for i, layer in enumerate(self.layers):
             qkv_delta_fn = qkv_delta_fns[i] if qkv_delta_fns is not None else None
-            if self.gradient_checkpointing and self.training and qkv_delta_fn is None:
-                concepts = torch.utils.checkpoint.checkpoint(
-                    layer, concepts, causal, padding_mask, None,
-                    use_reentrant=False,
-                )
-            else:
-                concepts = layer(concepts, causal=causal, padding_mask=padding_mask, qkv_delta_fn=qkv_delta_fn)
+            concepts = layer(concepts, causal=causal, padding_mask=padding_mask, qkv_delta_fn=qkv_delta_fn)
 
         concepts = self.norm(concepts)
 
@@ -90,10 +77,11 @@ class GlobalSelfAttention(nn.Module):
 
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.scale = self.head_dim ** -0.5
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
-        self.dropout_p = dropout
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, causal: bool = False, padding_mask: torch.Tensor = None, qkv_delta_fn=None) -> torch.Tensor:
         B, N, D = x.shape
@@ -106,35 +94,38 @@ class GlobalSelfAttention(nn.Module):
         qkv = qkv.view(B, N, 3, H, hd).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        # Build attn_mask only when there's padding (otherwise rely on is_causal
-        # fast path which dispatches to the fused causal kernel).
-        attn_mask = None
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        if causal:
+            mask = torch.triu(
+                torch.ones(N, N, device=x.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            attn = attn.masked_fill(mask, float('-inf'))
+
         if padding_mask is not None:
-            # padding_mask: (B, N) bool, True = ignore. Convert to a key mask
-            # (B, 1, 1, N) where True = allowed. SDPA with bool mask uses
-            # True=keep semantics.
-            keep = (~padding_mask).view(B, 1, 1, N)
-            if causal:
-                # Combine causal + padding into a single bool mask. Causal:
-                # (1,1,N,N) with True on/below diagonal.
-                causal_mask = torch.ones(N, N, device=x.device, dtype=torch.bool).tril()
-                attn_mask = causal_mask.view(1, 1, N, N) & keep
-                use_is_causal = False
-            else:
-                attn_mask = keep
-                use_is_causal = False
-        else:
-            use_is_causal = causal
+            attn = attn.masked_fill(
+                padding_mask.unsqueeze(1).unsqueeze(2),
+                float('-inf'),
+            )
 
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            is_causal=use_is_causal,
-            dropout_p=self.dropout_p if self.training else 0.0,
-        )
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
 
+        out = attn @ v
         out = out.transpose(1, 2).contiguous().view(B, N, D)
         return self.out_proj(out)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
 
 
 class SwiGLU(nn.Module):

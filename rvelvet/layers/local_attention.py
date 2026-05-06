@@ -1,16 +1,11 @@
 """
 Windowed self-attention with O(w²) complexity per window, O(n*w) total.
-
-Uses torch.nn.functional.scaled_dot_product_attention (Flash/mem-efficient
-backends auto-selected) for the attention core.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
-
-from ._norm import RMSNorm
+import math
 
 
 class LocalAttention(nn.Module):
@@ -32,10 +27,11 @@ class LocalAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.window_size = window_size
-        self.dropout_p = dropout
+        self.scale = self.head_dim ** -0.5
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
         B, L, D = x.shape
@@ -51,23 +47,28 @@ class LocalAttention(nn.Module):
         x = x.view(B, n_windows, W, D)
 
         qkv = self.qkv(x)
-        # (B, n_windows, W, 3, H, hd) -> (3, B, H, n_windows, W, hd)
         qkv = qkv.view(B, n_windows, W, 3, self.n_heads, self.head_dim)
         qkv = qkv.permute(3, 0, 4, 1, 2, 5)
         q, k, v = qkv.unbind(0)
 
-        # SDPA broadcasts over leading dims; treats last two as (L, D).
-        # Per-window attention => batch axes are (B, H, n_windows), seq=W.
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal=causal,
-            dropout_p=self.dropout_p if self.training else 0.0,
-        )
+        attn = (q @ k.transpose(-2, -1)) * self.scale
 
-        # (B, H, n_windows, W, hd) -> (B, n_windows, W, H, hd) -> (B, n_windows, W, D)
+        if causal:
+            mask = torch.triu(
+                torch.ones(W, W, device=x.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            attn = attn.masked_fill(mask, float('-inf'))
+
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+
+        out = attn @ v
         out = out.permute(0, 2, 3, 1, 4).contiguous()
         out = out.view(B, n_windows, W, D)
+
         out = self.out_proj(out)
+
         out = out.view(B, L_padded, D)
 
         if pad_len > 0:
@@ -117,18 +118,22 @@ class LocalEncoder(nn.Module):
             for _ in range(n_layers)
         ])
         self.norm = RMSNorm(d_model)
-        # Toggled by Trainer when cfg.training.gradient_checkpointing=True.
-        self.gradient_checkpointing = False
 
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
         for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    layer, x, causal, use_reentrant=False,
-                )
-            else:
-                x = layer(x, causal=causal)
+            x = layer(x, causal=causal)
         return self.norm(x)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
 
 
 class FFN(nn.Module):

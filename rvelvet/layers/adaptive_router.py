@@ -13,8 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from ._norm import RMSNorm
-
 
 class SegmentScanner(nn.Module):
     """
@@ -199,3 +197,12 @@ def compute_acr_losses(route_weights: torch.Tensor, route_logits: torch.Tensor) 
     }
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * norm * self.weight
