@@ -2,10 +2,26 @@
 Phase 3: CE + halting loss + deep supervision."""
 
 import torch
-import torch.nn.functional as F
 
 from ..layers.adaptive_router import compute_acr_losses
 from ..layers.halting import compute_halting_loss
+from .kernels.fused_ce import fused_cross_entropy
+
+
+def _ce_loss(logits_2d: torch.Tensor, targets_1d: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy with -1 ignore semantics, routed through fused_cross_entropy.
+
+    fused_cross_entropy avoids materializing the [N, V] softmax buffer
+    (~4.9 GB for our config). It does not natively support ignore_index, so we
+    filter -1 rows ourselves. In pretraining there are no -1 targets, so the
+    fast path runs without copies.
+    """
+    if (targets_1d == -1).any():
+        valid = targets_1d != -1
+        loss, _ = fused_cross_entropy(logits_2d[valid], targets_1d[valid])
+    else:
+        loss, _ = fused_cross_entropy(logits_2d, targets_1d)
+    return loss
 
 
 def compute_phase_loss(
@@ -19,11 +35,7 @@ def compute_phase_loss(
     """Compute total loss and components for the given phase."""
     logits = model_output['logits']
     B, L, V = logits.shape
-    ce_loss = F.cross_entropy(
-        logits.reshape(B * L, V),
-        targets.reshape(B * L),
-        ignore_index=-1,
-    )
+    ce_loss = _ce_loss(logits.reshape(B * L, V), targets.reshape(B * L))
     loss_dict = {'ce': ce_loss}
     total_loss = ce_loss
 
@@ -80,11 +92,7 @@ def _compute_deep_supervision(
         expanded = model.expansion(local_out, iter_concepts)
         normed = model.out_norm(expanded)
         logits = model.lm_head(normed)  # (B, L, V)
-        ce = F.cross_entropy(
-            logits.reshape(B * L, vocab_size),
-            targets.reshape(B * L),
-            ignore_index=-1,
-        )
+        ce = _ce_loss(logits.reshape(B * L, vocab_size), targets.reshape(B * L))
         losses.append(ce)
 
     return torch.stack(losses).mean()
