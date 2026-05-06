@@ -19,32 +19,13 @@ sources:
   - path: HuggingFaceFW/fineweb-2
     name: fra_Latn
     split: train
-    weight: 60
+    weight: 80
     text_field: text
 
   - path: wikimedia/wikipedia
     name: 20231101.fr
     split: train
-    weight: 15
-    text_field: text
-
-  - path: uonlp/CulturaX
-    name: fr
-    split: train
-    weight: 10
-    text_field: text
-
-  # Scientific / academic text (HAL-derived, FR-primary)
-  - path: bigscience-data/roots_fr_HAL
-    split: train
-    weight: 8
-    text_field: text
-
-  # Recent French news for journalistic register
-  - path: oscar-corpus/OSCAR-2301
-    name: fr
-    split: train
-    weight: 5
+    weight: 18
     text_field: text
 
   # Code with multilingual comments — keeps FR comments naturally
@@ -52,6 +33,10 @@ sources:
     split: train
     weight: 2
     text_field: content
+
+  # Removed gated sources (uonlp/CulturaX, bigscience-data/roots_fr_HAL,
+  # oscar-corpus/OSCAR-2301). To re-enable: request access on HF, set
+  # HF_TOKEN env var, then re-add the entries with appropriate weights.
 
 # Optional separate validation source (smaller, deterministic).
 # Falls back to data/val.bin if val_sources absent.
