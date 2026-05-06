@@ -297,8 +297,8 @@ class Trainer:
             try:
                 import wandb
                 wandb.init(project=tcfg.wandb_project, name=tcfg.wandb_run)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"WARNING: wandb.init failed: {e}")
 
         self.model.train()
         data_iter = iter(loader)
@@ -332,6 +332,7 @@ class Trainer:
         print(f"Effective batch: {tcfg.batch_size * accum_steps}")
         print(f"Max steps: {max_steps}")
         print("-" * 60)
+        print("Loading first batch from streaming dataset...", flush=True)
 
         try:
             while self.global_step < max_steps:
@@ -460,8 +461,11 @@ class Trainer:
                             log_dict = {
                                 **avg_dict,
                                 'lr': lr_now,
+                                'ppl': ppl_val,
                                 'step': self.global_step,
                                 'tokens_per_sec': tok_per_s,
+                                'vram_gb': torch.cuda.memory_allocated() / (1024 ** 3),
+                                'vram_peak_gb': torch.cuda.max_memory_allocated() / (1024 ** 3),
                             }
                             if self.use_velvet:
                                 log_dict['effective_beta1'] = self.optimizer.effective_beta1
@@ -470,8 +474,8 @@ class Trainer:
                                 log_dict['grad_norm'] = self.optimizer.last_grad_norm
                                 log_dict['skipped_window'] = skipped_window
                             wandb.log(log_dict)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            print(f"WARNING: wandb.log failed: {e}")
 
                     accum_loss = 0.0
                     loss_dict_accum = {}
