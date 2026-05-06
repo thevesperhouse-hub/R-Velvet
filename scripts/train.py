@@ -553,8 +553,18 @@ def main():
     if args.target_size:
         data_yaml = load_yaml(os.path.join("configs", "data", f"{data_name}.yaml"))
         max_seq_len = data_yaml.get("seq_len", 8192)
+        # Auto-detect vocab_size from the tokenizer if not explicitly set.
+        vocab_size = args.vocab_size
+        tok_path = data_yaml.get("tokenizer")
+        if tok_path and vocab_size == 64000:
+            try:
+                from transformers import AutoTokenizer
+                vocab_size = AutoTokenizer.from_pretrained(tok_path).vocab_size
+                print(f"Auto-detected vocab_size={vocab_size:,} from {tok_path}")
+            except Exception:
+                pass
         auto_dict = auto_size_from_target(
-            args.target_size, vocab_size=args.vocab_size, max_seq_len=max_seq_len,
+            args.target_size, vocab_size=vocab_size, max_seq_len=max_seq_len,
         )
     elif args.model is None:
         # Full interactive wizard — only fires on a TTY without an explicit
