@@ -166,7 +166,7 @@ def main():
     parser.add_argument("--phase", type=str, required=True,
                         choices=["phase1_pretrain", "phase2_acr", "phase3_iterative"],
                         help="Training phase")
-    parser.add_argument("--model", type=str, default="base", choices=["small", "base"],
+    parser.add_argument("--model", type=str, default="base", choices=["small", "base", "1_3b"],
                         help="Model config name")
     parser.add_argument("--resume", type=str, default=None,
                         help="Checkpoint path to resume from")
