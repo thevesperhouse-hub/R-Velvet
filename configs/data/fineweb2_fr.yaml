@@ -1,16 +1,13 @@
-# Streaming multi-source FR mix for Phase 1 / Phase 2 base pretraining.
+# Streaming FR pretraining: FineWeb-2 only.
 # Used when `train_path` is absent and `sources` is present — train.py
 # auto-dispatches to StreamingTextDataset.
-#
-# Weights are normalized by the dataloader; the *relative* values are what
-# matter. Aim is FR-primary with topic diversity.
 
 seq_len: 2048
 stride: null
 tokenizer: data/velvet_tok_100k_unigram
-num_workers: 4
-prefetch_factor: 4
-shuffle_buffer: 20000
+num_workers: 2
+prefetch_factor: 2
+shuffle_buffer: 1000
 max_doc_tokens: 65536
 stopping_strategy: all_exhausted
 eos_token_id: null   # null → use tokenizer.eos_token_id
@@ -19,18 +16,8 @@ sources:
   - path: HuggingFaceFW/fineweb-2
     name: fra_Latn
     split: train
-    weight: 80
+    weight: 1
     text_field: text
-
-  - path: wikimedia/wikipedia
-    name: 20231101.fr
-    split: train
-    weight: 20
-    text_field: text
-
-  # Removed gated sources (uonlp/CulturaX, bigscience-data/roots_fr_HAL,
-  # oscar-corpus/OSCAR-2301, bigcode/the-stack-smol). To re-enable: request
-  # access on HF, set HF_TOKEN env var, then re-add the entries.
 
 # Optional separate validation source (smaller, deterministic).
 # Falls back to data/val.bin if val_sources absent.
