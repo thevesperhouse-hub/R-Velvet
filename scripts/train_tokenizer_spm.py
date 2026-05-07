@@ -78,12 +78,21 @@ def _iter_local_file(path: str, max_examples: Optional[int]) -> Iterator[str]:
                     return
 
 
-def _parse_hf_spec(spec: str) -> Tuple[str, Optional[str], str, float]:
-    """spec: '<repo>:<name>:<split>[@<weight>]' or '<repo>::<split>[@<weight>]'."""
+def _parse_hf_spec(spec: str) -> Tuple[str, Optional[str], str, float, str]:
+    """spec: '<repo>:<name>:<split>[#field][@<weight>]'.
+
+    Examples:
+        uonlp/CulturaX:fr:train@0.5          -> text_field='text'
+        bigcode/starcoderdata::train#content@0.3  -> text_field='content'
+    """
     weight = 1.0
     if "@" in spec:
         spec, w = spec.rsplit("@", 1)
         weight = float(w)
+
+    text_field = "text"
+    if "#" in spec:
+        spec, text_field = spec.rsplit("#", 1)
 
     parts = spec.split(":")
     if len(parts) == 2:
@@ -96,29 +105,40 @@ def _parse_hf_spec(spec: str) -> Tuple[str, Optional[str], str, float]:
     else:
         raise ValueError(
             f"Bad --hf-source spec {spec!r}. "
-            "Expected '<repo>:<name>:<split>[@<weight>]' or '<repo>::<split>[@<weight>]'."
+            "Expected '<repo>:<name>:<split>[#field][@<weight>]'."
         )
-    return repo, name, split, weight
+    return repo, name, split, weight, text_field
 
 
 def _iter_hf_streams(specs: List[str], max_examples: Optional[int],
-                     text_field: str = "text") -> Iterator[str]:
+                     text_field: str = "text",
+                     min_line_len: int = 50) -> Iterator[str]:
     """Stream from one or more HF datasets, interleaved by weight if multiple.
 
     Yields one line at a time (not full documents). SPM treats each yielded
     string as a sentence to be considered for the suffix array sampling.
+
+    Each source can override the text field via '#field' in the spec string
+    (e.g. 'bigcode/starcoderdata::train#content@0.3').
     """
     from datasets import load_dataset, interleave_datasets
 
     parsed = [_parse_hf_spec(s) for s in specs]
 
+    # Build a list of per-source text fields so we can look up the right
+    # column after interleaving (interleave loses provenance).
+    source_fields = set()
     datasets_list = []
     weights = []
-    for repo, name, split, weight in parsed:
+    for repo, name, split, weight, field in parsed:
         ds = load_dataset(repo, name=name, split=split, streaming=True)
-        print(f"  HF streaming: {repo} (config={name}, split={split}, weight={weight})")
+        print(f"  HF streaming: {repo} (config={name}, split={split}, weight={weight}, field={field})")
         datasets_list.append(ds)
         weights.append(weight)
+        source_fields.add(field)
+
+    # Ordered list of fields to try per example (most specific first).
+    field_priority = list(source_fields)
 
     if len(datasets_list) == 1:
         ds = datasets_list[0]
@@ -134,14 +154,17 @@ def _iter_hf_streams(specs: List[str], max_examples: Optional[int],
 
     n_docs = 0
     for example in ds:
-        txt = example.get(text_field) or ""
+        # Try each known text field until one returns content.
+        txt = None
+        for f in field_priority:
+            txt = example.get(f) or None
+            if txt:
+                break
         if not txt:
             continue
         for line in txt.splitlines():
             line = line.strip()
-            # Filter very short lines (often nav/garbage on web crawls).
-            # 50 chars is the threshold used by Mistral / Gemma corpus prep.
-            if len(line) >= 50:
+            if len(line) >= min_line_len:
                 yield line
         n_docs += 1
         if max_examples and n_docs >= max_examples:
@@ -153,7 +176,8 @@ def _build_corpus_iterator(args, max_examples: Optional[int] = None) -> Iterable
     if args.input:
         return _iter_local_file(args.input, cap)
     if args.hf_source:
-        return _iter_hf_streams(args.hf_source, cap, text_field=args.text_field)
+        return _iter_hf_streams(args.hf_source, cap, text_field=args.text_field,
+                                min_line_len=getattr(args, 'min_line_len', 50))
     raise SystemExit("Provide either --input or --hf-source.")
 
 
@@ -201,6 +225,9 @@ def main():
                         help="Disable byte-level fallback for OOV. Default ON.")
     parser.add_argument("--no-split-digits", action="store_true",
                         help="Disable splitting digits one-by-one. Default ON.")
+    parser.add_argument("--min-line-len", type=int, default=20,
+                        help="Minimum line length to keep (chars). Lower for "
+                             "code-heavy mixes (many short lines). Default 20.")
     parser.add_argument("--eval-docs", type=int, default=2000,
                         help="After training, stream N held-out docs and report "
                              "real chars/token. Set 0 to skip.")

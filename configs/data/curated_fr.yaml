@@ -1,0 +1,27 @@
+seq_len: 2048
+stride: null
+tokenizer: data/velvet_tok_100k_unigram
+num_workers: 0
+shuffle_buffer: 5000
+max_doc_tokens: 65536
+stopping_strategy: all_exhausted
+eos_token_id: null
+
+sources:
+  - path: uonlp/CulturaX
+    name: fr
+    split: train
+    weight: 70
+    text_field: text
+  - path: wikimedia/wikipedia
+    name: 20231101.fr
+    split: train
+    weight: 20
+    text_field: text
+  - path: HuggingFaceFW/fineweb-2
+    name: fra_Latn
+    split: train
+    weight: 10
+    text_field: text
+
+val_path: data/val.bin

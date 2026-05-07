@@ -28,6 +28,10 @@ class Trainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
 
+        if getattr(self.tcfg, 'compile', False) and hasattr(torch, 'compile'):
+            print("Compiling model with torch.compile...")
+            self.model = torch.compile(self.model)
+
         self.amp_dtype = self._resolve_amp_dtype()
         self.scaler = torch.amp.GradScaler('cuda', enabled=(self.amp_dtype == torch.float16))
 
@@ -176,6 +180,11 @@ class Trainer:
         print(f"Phase: {self.phase}")
         print(f"Trainable params: {n_trainable:,}")
         print(f"Device: {self.device} | AMP: {self.amp_dtype}")
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name()
+            gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+            from .kernels import GPU_ARCH, GPU_SM, get_backend
+            print(f"GPU: {gpu_name} ({gpu_mem:.0f}GB) | Arch: {GPU_ARCH} (SM{GPU_SM}) | Kernels: {get_backend()}")
         print(f"Optimizer: {optim_name}", end="")
         if self.use_velvet:
             print(f" (backend={self.optimizer.kernel_backend}, PGM+LVS)")

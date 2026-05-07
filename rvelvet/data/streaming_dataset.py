@@ -106,6 +106,7 @@ class StreamingTextDataset(IterableDataset):
                 name=src.get("name"),
                 split=src.get("split", "train"),
                 streaming=True,
+                data_files=src.get("data_files"),
             )
             streams.append(ds)
 
