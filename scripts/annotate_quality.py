@@ -276,12 +276,17 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Resume support
+    # Resume support — never silently overwrite existing annotations
     n_done = 0
-    if args.resume and output_path.exists():
+    if output_path.exists():
         with open(output_path, "r", encoding="utf-8") as f:
             n_done = sum(1 for _ in f)
-        print(f"Resuming from {n_done:,} existing annotations")
+        if n_done > 0 and not args.resume:
+            print(f"ERROR: {output_path} already has {n_done:,} annotations.")
+            print(f"Use --resume to continue, or delete the file to restart.")
+            sys.exit(1)
+        if args.resume:
+            print(f"Resuming from {n_done:,} existing annotations")
 
     print(f"Annotating {args.n_docs:,} docs from {args.hf_source} ({args.hf_name})")
     print(f"Model: {args.model}")
