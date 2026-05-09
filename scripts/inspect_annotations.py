@@ -49,20 +49,20 @@ def main():
     print()
 
     # Dimension averages
-    print("Dimension averages (0-2):")
+    print("Dimension averages (0-5):")
     for dim in DIMS:
         vals = [r[dim] for r in records if dim in r]
         if vals:
             avg = sum(vals) / len(vals)
-            bar = "#" * int(avg * 20)
-            print(f"  {dim:15s}: {avg:.3f}/2.0  {bar}  (n={len(vals):,})")
+            bar = "#" * int(avg * 8)
+            print(f"  {dim:15s}: {avg:.3f}/5.0  {bar}  (n={len(vals):,})")
 
     # Total distribution
     print()
-    print("Total score distribution (0-10):")
+    print("Total score distribution (0-25):")
     totals = [r["total"] for r in records if "total" in r]
     counts = Counter(totals)
-    for s in range(11):
+    for s in range(26):
         c = counts.get(s, 0)
         pct = c / len(totals) * 100 if totals else 0
         bar = "#" * int(pct)

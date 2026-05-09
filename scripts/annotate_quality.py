@@ -5,13 +5,13 @@ Pipeline step 1/3 for building Vesper-Edu-FR:
     2. train_quality_classifier.py — train fasttext on annotations
     3. filter_dataset.py     — apply classifier to full corpus
 
-Each document gets scored on 6 independent axes (0-2 each):
+Each document gets scored on 5 independent axes (0-5 each, total 0-25):
     - coherence:  logical structure, reasoning quality
     - pedagogy:   educational value, clarity of explanations
     - linguistic: grammar, syntax, proper French
     - depth:      substance, examples, developed arguments
     - factuality: reliable, verifiable information
-    - code_quality: (code only) clean, documented, idiomatic
+    - code_quality: (code only, replaces linguistic) clean, documented, idiomatic
 
 Usage:
     # Start vLLM server first:
@@ -44,36 +44,62 @@ except (AttributeError, OSError):
 
 DIMENSIONS = ["coherence", "pedagogy", "linguistic", "depth", "factuality"]
 
-SCORING_PROMPT = """Tu es un expert en évaluation de la qualité de textes francophones pour l'entraînement de modèles de langage.
+SCORING_PROMPT = """Tu es un évaluateur STRICT de textes francophones pour l'entraînement de modèles de langage. Tu dois être EXIGEANT : un 5 est RARE et réservé à un texte d'excellence. La plupart des textes web méritent entre 1 et 3.
 
-Évalue l'extrait suivant sur chaque axe avec une note de 0 à 2 :
+Évalue l'extrait suivant sur chaque axe avec une note de 0 à 5 :
 
 **coherence** — Structure logique et raisonnement
-  0 = incohérent, spam, fragments sans lien
-  1 = compréhensible mais mal organisé, saute du coq à l'âne
-  2 = raisonnement clair, progression logique, bien structuré
+  0 = spam, code HTML, fragments sans sens, texte généré
+  1 = compréhensible mais décousu, pas de fil conducteur
+  2 = suit un sujet mais mal organisé, transitions abruptes
+  3 = structure correcte, le lecteur peut suivre sans effort
+  4 = bien organisé, progression logique claire, bon plan
+  5 = raisonnement rigoureux, structure exemplaire (niveau article académique)
 
 **pedagogy** — Valeur pédagogique et clarté des explications
-  0 = aucune valeur éducative (pub, navigation, opinions vides)
-  1 = informatif mais pas pédagogique, manque d'explications
-  2 = explique clairement, pourrait servir dans un cours ou un manuel
+  0 = aucune (pub, navigation, metadata, listings, opinions sans fond)
+  1 = mentionne des faits mais n'explique rien
+  2 = informatif mais pas pédagogique, le lecteur n'apprend pas vraiment
+  3 = explique un sujet de manière compréhensible
+  4 = pédagogie claire avec exemples, pourrait servir dans un cours
+  5 = excellent matériel éducatif (niveau manuel scolaire ou universitaire)
 
 **linguistic** — Qualité du français
-  0 = illisible, bourrés de fautes, mélange de langues
-  1 = correct mais maladroit, registre familier, quelques erreurs
-  2 = français soigné, syntaxe maîtrisée, registre approprié
+  0 = illisible, langue étrangère, bouillie de caractères
+  1 = français cassé, fautes majeures à chaque phrase
+  2 = compréhensible mais maladroit, registre familier, anglicismes
+  3 = français correct, quelques maladresses mineures
+  4 = bien écrit, syntaxe maîtrisée, vocabulaire précis
+  5 = français exemplaire, prose soignée (niveau littéraire ou journalistique)
 
 **depth** — Profondeur et substance
-  0 = superficiel, une phrase, liste sans contexte
-  1 = traite le sujet mais reste en surface
-  2 = développe en profondeur, exemples, nuances, argumentation
+  0 = vide (une phrase, titre seul, liste de liens, metadata)
+  1 = superficiel, survole le sujet en quelques lignes
+  2 = aborde le sujet mais reste en surface, pas de détails
+  3 = traitement correct avec quelques détails ou exemples
+  4 = analyse approfondie, arguments développés, nuances
+  5 = traitement exhaustif, multiple angles, niveau expert
 
 **factuality** — Fiabilité factuelle
-  0 = faux, trompeur, conspirationniste, désinformation
-  1 = plausible mais non vérifiable, opinions présentées comme faits
-  2 = fiable, sourcé ou vérifiable, contenu factuel solide
+  0 = faux, désinformation, conspirationniste, dangereux
+  1 = très douteux, affirmations non vérifiables, biais forts
+  2 = mélange vrai/faux, opinions présentées comme faits
+  3 = globalement plausible mais sans sources
+  4 = fiable, informations vérifiables, peu d'erreurs
+  5 = rigoureux, sourcé ou vérifiable, niveau encyclopédique
 
-Extrait :
+EXEMPLES DE CALIBRATION :
+
+Texte : "Accueil > Nos produits > Mentions légales > Contact | © 2024 Tous droits réservés"
+→ {{"coherence": 0, "pedagogy": 0, "linguistic": 1, "depth": 0, "factuality": 0}}
+
+Texte : "La polémique entourant les covers du second mini-album des Girls' Generation aura finalement obligé SM à repousser sa sortie."
+→ {{"coherence": 2, "pedagogy": 0, "linguistic": 3, "depth": 1, "factuality": 2}}
+
+Texte : "La photosynthèse est le processus par lequel les plantes convertissent le CO2 et l'eau en glucose et en oxygène, en utilisant l'énergie lumineuse captée par la chlorophylle. Ce mécanisme se déroule en deux phases : les réactions lumineuses dans les thylakoïdes, puis le cycle de Calvin dans le stroma."
+→ {{"coherence": 5, "pedagogy": 5, "linguistic": 5, "depth": 4, "factuality": 5}}
+
+Maintenant évalue cet extrait :
 ---
 {text}
 ---
@@ -82,34 +108,49 @@ Réponds UNIQUEMENT avec un JSON, rien d'autre :
 {{"coherence": N, "pedagogy": N, "linguistic": N, "depth": N, "factuality": N}}"""
 
 
-SCORING_PROMPT_CODE = """Tu es un expert en évaluation de la qualité de code source pour l'entraînement de modèles de langage.
+SCORING_PROMPT_CODE = """Tu es un évaluateur STRICT de code source pour l'entraînement de modèles de langage. Tu dois être EXIGEANT : un 5 est RARE. La plupart du code sur GitHub mérite entre 1 et 3.
 
-Évalue l'extrait suivant sur chaque axe avec une note de 0 à 2 :
+Évalue l'extrait suivant sur chaque axe avec une note de 0 à 5 :
 
 **coherence** — Structure logique du code
   0 = fragments incomplets, code cassé, pas de logique visible
-  1 = fonctionne probablement mais mal organisé
-  2 = bien structuré, flux logique clair, bonne architecture
+  1 = code qui existe mais sans structure claire
+  2 = fonctionne probablement mais mal organisé
+  3 = structure correcte, fonctions séparées, flux logique clair
+  4 = bien architecturé, séparation des responsabilités
+  5 = architecture exemplaire, patterns clairs, code maintenable
 
 **code_quality** — Propreté et bonnes pratiques
-  0 = illisible, noms de variables obscurs, code spaghetti
-  1 = acceptable mais pas exemplaire, manque de standards
-  2 = propre, idiomatique, suit les conventions du langage
+  0 = illisible, noms de variables obscurs (a, b, x1), code spaghetti
+  1 = lisible mais ne suit aucune convention
+  2 = acceptable, quelques bonnes pratiques
+  3 = propre, nommage clair, suit les conventions du langage
+  4 = idiomatique, gestion d'erreurs, types quand approprié
+  5 = exemplaire, pourrait être dans la documentation officielle du langage
 
 **pedagogy** — Valeur éducative du code
-  0 = aucune (boilerplate, config auto-générée, code trivial)
-  1 = montre un pattern utile mais sans explication
-  2 = code instructif, bien commenté, bon exemple à apprendre
+  0 = aucune (config auto-générée, boilerplate, fichiers vides, minifié)
+  1 = code trivial sans intérêt pédagogique
+  2 = montre un pattern mais sans explication
+  3 = code utile pour apprendre, logique claire
+  4 = bien commenté, bon exemple d'un concept ou pattern
+  5 = tutoriel quality, code instructif avec commentaires pédagogiques
 
 **depth** — Complexité pertinente
-  0 = trivial (hello world, imports seuls, fichiers vides)
-  1 = résout un problème réel mais simple
-  2 = algorithme non trivial, design pattern, logique métier intéressante
+  0 = trivial (hello world, imports seuls, constantes)
+  1 = très simple (getter/setter, CRUD basique)
+  2 = résout un problème simple
+  3 = logique métier réelle, algorithme non trivial
+  4 = système complexe, design patterns, optimisations
+  5 = algorithme avancé, architecture système complète
 
 **factuality** — Fiabilité technique
-  0 = bugs évidents, anti-patterns dangereux, code vulnérable
-  1 = fonctionne mais avec des pratiques discutables
-  2 = correct, sécurisé, gestion d'erreurs appropriée
+  0 = bugs évidents, anti-patterns dangereux, vulnérabilités
+  1 = code douteux, race conditions, injections possibles
+  2 = fonctionne mais pratiques discutables
+  3 = correct, pas de bug évident
+  4 = robuste, gestion d'erreurs, code défensif
+  5 = production-ready, sécurisé, testé
 
 Extrait :
 ---
@@ -164,11 +205,11 @@ def parse_scores(response_text: str, text: str) -> dict:
             scores = {}
             for dim in dims:
                 val = data.get(dim, -1)
-                if isinstance(val, (int, float)) and 0 <= val <= 2:
+                if isinstance(val, (int, float)) and 0 <= val <= 5:
                     scores[dim] = int(val)
                 else:
                     return None
-            # Compute aggregate (sum of all dims, max = 10)
+            # Compute aggregate (sum of all dims, max = 25)
             scores["total"] = sum(scores[d] for d in dims)
             return scores
     except (json.JSONDecodeError, ValueError, TypeError):
@@ -341,16 +382,16 @@ def main():
     print(f"\nDone: {n_annotated:,} annotations in {elapsed/3600:.1f}h")
     print(f"Skipped (unparseable): {n_skipped:,}")
 
-    print(f"\nDimension averages (0-2 scale):")
+    print(f"\nDimension averages (0-5 scale):")
     for dim in ["coherence", "pedagogy", "linguistic", "depth", "factuality", "code_quality"]:
         if dim in dim_counts and dim_counts[dim] > 0:
             avg = dim_sums[dim] / dim_counts[dim]
-            bar = "█" * int(avg * 20)
-            print(f"  {dim:15s}: {avg:.3f}/2.0 {bar}")
+            bar = "█" * int(avg * 8)
+            print(f"  {dim:15s}: {avg:.3f}/5.0 {bar}")
 
     print(f"\nSaved: {output_path}")
     print(f"\nEach record contains: text, doc_id, coherence, pedagogy, linguistic|code_quality, depth, factuality, total")
-    print(f"Total score range: 0-10 (sum of 5 dimensions)")
+    print(f"Total score range: 0-25 (sum of 5 dimensions)")
 
 
 if __name__ == "__main__":

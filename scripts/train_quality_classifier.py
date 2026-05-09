@@ -120,10 +120,10 @@ def main():
                         help="JSONL file from annotate_quality.py")
     parser.add_argument("--output", type=str, default="data/quality_classifier",
                         help="Output directory for classifiers")
-    parser.add_argument("--dim-threshold", type=int, default=1,
-                        help="Score >= this is 'high' for each dimension (0-2 scale)")
-    parser.add_argument("--total-threshold", type=int, default=7,
-                        help="Total score >= this is 'high' for global classifier (0-10 scale)")
+    parser.add_argument("--dim-threshold", type=int, default=3,
+                        help="Score >= this is 'high' for each dimension (0-5 scale)")
+    parser.add_argument("--total-threshold", type=int, default=17,
+                        help="Total score >= this is 'high' for global classifier (0-25 scale)")
     parser.add_argument("--val-ratio", type=float, default=0.1,
                         help="Fraction of data for validation")
     parser.add_argument("--epochs", type=int, default=25)
@@ -140,16 +140,16 @@ def main():
     print(f"  Loaded {len(records):,} annotations")
 
     # Show dimension stats
-    print(f"\n  Dimension distributions (0 / 1 / 2):")
+    print(f"\n  Dimension distributions (0-5):")
     for dim in DIMENSIONS:
         counts = Counter(r.get(dim, -1) for r in records)
         if counts.get(-1, 0) == len(records):
             continue
-        parts = " ".join(f"{s}:{counts.get(s, 0):,}" for s in range(3))
+        parts = " ".join(f"{s}:{counts.get(s, 0):,}" for s in range(6))
         print(f"    {dim:15s}: {parts}")
 
     total_counts = Counter(r["total"] for r in records)
-    print(f"\n  Total score distribution (0-10):")
+    print(f"\n  Total score distribution (0-25):")
     for s in sorted(total_counts):
         bar = "█" * (total_counts[s] // max(len(records) // 200, 1))
         print(f"    {s:2d}: {total_counts[s]:>6,} {bar}")
