@@ -40,6 +40,18 @@ def prepare_text(text: str, max_words: int = 500) -> str:
     return clean
 
 
+def is_code(text: str) -> bool:
+    """Heuristic: detect if text is primarily code."""
+    indicators = [
+        "def ", "class ", "import ", "function ", "return ",
+        "if (", "for (", "while (", "const ", "let ", "var ",
+        "#include", "public static", "func ", "fn ",
+    ]
+    lines = text[:2000].split("\n")
+    code_lines = sum(1 for l in lines if any(ind in l for ind in indicators))
+    return code_lines > len(lines) * 0.3
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Filter FineWeb-2 FR with quality classifiers")
@@ -78,6 +90,11 @@ def main():
         config = json.load(f)
 
     # Load classifiers
+    # code_quality only applies to code, not to French text — load it
+    # separately so it doesn't block text documents from passing.
+    TEXT_DIMS = ["coherence", "pedagogy", "linguistic", "depth", "factuality"]
+    CODE_DIMS = ["coherence", "code_quality", "pedagogy", "depth", "factuality"]
+
     models = {}
     if args.mode == "global":
         global_path = classifier_dir / "classifier_global.bin"
@@ -114,11 +131,16 @@ def main():
     # Track per-dimension pass rates
     dim_pass_counts = {dim: 0 for dim in models}
 
-    def classify(text: str) -> dict:
-        """Classify text, return dict of {dim: (label, confidence)}."""
+    def classify(text: str) -> tuple:
+        """Classify text, return (predictions dict, relevant_dims list)."""
         clean = prepare_text(text)
+        # Pick relevant dimensions based on text type
+        relevant = CODE_DIMS if is_code(text) else TEXT_DIMS
         result = {}
-        for dim, model in models.items():
+        for dim in relevant:
+            if dim not in models:
+                continue
+            model = models[dim]
             labels, probs = model.predict(clean, k=-1)
             for label, prob in zip(labels, probs):
                 if label == "__label__high":
@@ -126,7 +148,7 @@ def main():
                     break
             else:
                 result[dim] = ("low", 0.0)
-        return result
+        return result, relevant
 
     print(f"\nFiltering...")
 
@@ -139,22 +161,22 @@ def main():
                 continue
 
             n_total += 1
-            predictions = classify(text)
+            predictions, relevant = classify(text)
 
             if args.mode == "global":
                 label, conf = predictions.get("global", ("low", 0.0))
                 keep = (label == "high" and conf >= args.threshold)
             else:
-                # Count how many dimensions pass
+                # Count how many relevant dimensions pass
                 dims_passed = 0
-                dim_scores = {}
+                n_relevant = len([d for d in relevant if d in models])
+                required = args.min_dims_pass or n_relevant
                 for dim, (label, conf) in predictions.items():
                     passes = (label == "high" and conf >= args.threshold)
                     if passes:
                         dims_passed += 1
-                        dim_pass_counts[dim] += 1
-                    dim_scores[dim] = conf
-                keep = (dims_passed >= min_dims)
+                        dim_pass_counts[dim] = dim_pass_counts.get(dim, 0) + 1
+                keep = (dims_passed >= required)
 
             if keep:
                 record = {
