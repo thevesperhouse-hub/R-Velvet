@@ -150,7 +150,12 @@ def main():
                 result[dim] = ("low", 0.0)
         return result, relevant
 
-    print(f"\nFiltering...")
+    from tqdm import tqdm
+
+    total_docs = args.max_docs or 360_000_000  # FineWeb-2 FR approximate size
+    pbar = tqdm(total=total_docs, unit="docs", desc="Filtering",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] kept={postfix[kept]} ({postfix[pct]}%)")
+    pbar.set_postfix(kept=0, pct="0.0")
 
     try:
         for example in ds:
@@ -158,6 +163,7 @@ def main():
             if not text or len(text) < 100:
                 n_total += 1
                 n_rejected += 1
+                pbar.update(1)
                 continue
 
             n_total += 1
@@ -178,6 +184,10 @@ def main():
                         dim_pass_counts[dim] = dim_pass_counts.get(dim, 0) + 1
                 keep = (dims_passed >= required)
 
+            pbar.update(1)
+            pbar.set_postfix(kept=n_kept + (1 if keep else 0),
+                             pct=f"{(n_kept + (1 if keep else 0)) / max(n_total, 1) * 100:.1f}")
+
             if keep:
                 record = {
                     "text": text,
@@ -193,22 +203,6 @@ def main():
             else:
                 n_rejected += 1
 
-            if n_total % 50_000 == 0:
-                elapsed = time.time() - t0
-                rate = n_total / elapsed
-                keep_pct = n_kept / max(n_total, 1) * 100
-
-                dim_parts = []
-                if args.mode == "dimensions":
-                    for dim in models:
-                        dpct = dim_pass_counts[dim] / max(n_total, 1) * 100
-                        dim_parts.append(f"{dim[:4]}={dpct:.0f}%")
-
-                print(f"  {n_total:,} processed | "
-                      f"{n_kept:,} kept ({keep_pct:.1f}%) | "
-                      f"{rate:.0f} docs/s | "
-                      f"{' '.join(dim_parts)}")
-
             if args.push_to_hub and len(chunk_records) >= args.chunk_size:
                 _push_chunk(chunk_records, args.push_to_hub, n_kept)
                 chunk_records = []
@@ -219,6 +213,7 @@ def main():
     except KeyboardInterrupt:
         print(f"\nInterrupted at {n_total:,} docs")
     finally:
+        pbar.close()
         f_out.close()
 
     if args.push_to_hub and chunk_records:
