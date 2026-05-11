@@ -153,9 +153,8 @@ def main():
     from tqdm import tqdm
 
     total_docs = args.max_docs or 360_000_000  # FineWeb-2 FR approximate size
-    pbar = tqdm(total=total_docs, unit="docs", desc="Filtering",
-                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] kept={postfix[kept]} ({postfix[pct]}%)")
-    pbar.set_postfix(kept=0, pct="0.0")
+    pbar = tqdm(total=total_docs, unit="docs", desc="Filtering")
+    pbar.set_postfix(kept=0, pct="0.0%")
 
     try:
         for example in ds:
@@ -185,8 +184,9 @@ def main():
                 keep = (dims_passed >= required)
 
             pbar.update(1)
-            pbar.set_postfix(kept=n_kept + (1 if keep else 0),
-                             pct=f"{(n_kept + (1 if keep else 0)) / max(n_total, 1) * 100:.1f}")
+            if keep:
+                pbar.set_postfix(kept=n_kept + 1,
+                                 pct=f"{(n_kept + 1) / max(n_total, 1) * 100:.1f}%")
 
             if keep:
                 record = {
