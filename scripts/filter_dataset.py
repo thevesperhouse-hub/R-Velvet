@@ -199,7 +199,8 @@ def main():
 
                 f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
                 n_kept += 1
-                chunk_records.append(record)
+                if args.push_to_hub:
+                    chunk_records.append(record)
             else:
                 n_rejected += 1
 
