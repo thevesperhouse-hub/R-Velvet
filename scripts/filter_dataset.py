@@ -69,6 +69,8 @@ def main():
                              "Default: all of them")
     parser.add_argument("--max-docs", type=int, default=None,
                         help="Max docs to process (None = all)")
+    parser.add_argument("--skip", type=int, default=0,
+                        help="Skip first N docs from source (for resuming)")
     parser.add_argument("--hf-source", type=str,
                         default="HuggingFaceFW/fineweb-2")
     parser.add_argument("--hf-name", type=str, default="fra_Latn")
@@ -120,7 +122,8 @@ def main():
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    f_out = open(output_path, "w", encoding="utf-8")
+    # Append if resuming with --skip, otherwise overwrite
+    f_out = open(output_path, "a" if args.skip > 0 else "w", encoding="utf-8")
 
     n_total = 0
     n_kept = 0
@@ -153,6 +156,21 @@ def main():
     from tqdm import tqdm
 
     total_docs = args.max_docs or 360_000_000  # FineWeb-2 FR approximate size
+    skip = args.skip
+
+    if skip > 0:
+        print(f"Skipping first {skip:,} docs...")
+        pbar_skip = tqdm(total=skip, unit="docs", desc="Skipping")
+        n_skipped = 0
+        for example in ds:
+            n_skipped += 1
+            pbar_skip.update(1)
+            if n_skipped >= skip:
+                break
+        pbar_skip.close()
+        print(f"Skipped {n_skipped:,} docs, starting filtering...")
+        total_docs = total_docs - skip
+
     pbar = tqdm(total=total_docs, unit="docs", desc="Filtering")
     pbar.set_postfix(kept=0, pct="0.0%")
 
