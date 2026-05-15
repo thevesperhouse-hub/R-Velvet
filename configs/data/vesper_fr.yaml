@@ -1,6 +1,6 @@
 seq_len: 2048
 stride: null
-tokenizer: data/velvet_tok_100k_unigram
+tokenizer: AkiraXan/velvet_tok_100k_unigram
 num_workers: 0
 shuffle_buffer: 10000
 max_doc_tokens: 65536
