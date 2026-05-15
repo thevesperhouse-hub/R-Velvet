@@ -2,7 +2,7 @@
 phase: phase1_pretrain
 use_acr: false
 use_iterative_reasoning: false
-optimizer: adamw           # adamw or velvet
+optimizer: velvet           # adamw or velvet
 
 lr: 3e-4
 min_lr: 3e-5
