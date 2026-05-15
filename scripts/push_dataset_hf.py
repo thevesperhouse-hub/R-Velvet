@@ -27,7 +27,6 @@ task_categories:
 tags:
 - pretrain
 - french
-- education
 - quality-filtered
 - fineweb
 dataset_info:
@@ -53,19 +52,19 @@ configs:
     path: "data/*.parquet"
 ---
 
-# Vesper-Edu-FR
+# Vesper-FR
 
-**High-quality French pretraining dataset filtered from FineWeb-2.**
+**Quality-filtered French pretraining corpus derived from FineWeb-2.**
 
-{n_docs} documents selected for educational value, linguistic quality, and factual reliability.
+{n_docs} documents selected for coherence, linguistic quality, depth, and factual reliability from ~186M processed documents.
 
 ## Overview
 
-Vesper-Edu-FR is a curated subset of [FineWeb-2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2) (French partition), filtered using multi-dimensional quality classifiers. The goal is to provide a high-quality French corpus for LLM pretraining, similar to what [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) achieves for English.
+Vesper-FR is a curated subset of [FineWeb-2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2) (French partition, `fra_Latn`). Documents are filtered using multi-dimensional quality classifiers trained via LLM-assisted annotation, then deduplicated.
+
+This is not an "educational" dataset — it is a general-purpose, quality-filtered French web corpus suitable for LLM pretraining.
 
 ## Filtering pipeline
-
-The dataset was built in 3 steps:
 
 ### Step 1 — LLM annotation (~650k documents)
 A sample of FineWeb-2 FR was scored by **Qwen2.5-32B-Instruct** on 5 independent quality dimensions (0-5 scale each):
@@ -83,29 +82,33 @@ For code documents, `linguistic` is replaced by `code_quality` (clean, documente
 The scoring prompt was calibrated to be strict: most web text scores 1-3, a 5 is rare and reserved for excellence.
 
 ### Step 2 — Fasttext classifier training
-One binary fasttext classifier was trained per dimension on the LLM annotations (score >= 3 → "high", < 3 → "low"). Validation F1 scores:
+One binary fasttext classifier was trained per dimension on the LLM annotations (score >= 3 = "high", < 3 = "low").
 
-| Classifier | F1 |
-|---|---|
-| coherence | ~0.88 |
-| pedagogy | ~0.85 |
-| linguistic | ~0.87 |
-| depth | ~0.86 |
-| factuality | ~0.88 |
+| Classifier | F1 | Precision | Recall | Train samples |
+|---|---|---|---|---|
+| coherence | 0.831 | 0.831 | 0.831 | 588k |
+| pedagogy | 0.870 | 0.870 | 0.870 | 588k |
+| linguistic | 0.924 | 0.924 | 0.924 | 581k |
+| depth | 0.831 | 0.831 | 0.831 | 588k |
+| factuality | 0.866 | 0.866 | 0.866 | 588k |
+| code_quality | 1.000 | 1.000 | 1.000 | 7k |
+| **global** | **0.848** | **0.848** | **0.848** | 588k |
 
-### Step 3 — Full corpus filtering
-The fasttext classifiers were applied to the full FineWeb-2 FR corpus (~186M documents processed). A document is kept only if **all relevant dimensions** pass with confidence >= 0.65.
+### Step 3 — Corpus filtering
+The classifiers were applied to ~186M documents from FineWeb-2 FR (streamed). A document is kept only if **all relevant dimensions** pass with confidence >= 0.65.
 
-Text documents must pass: coherence, pedagogy, linguistic, depth, factuality.
-Code documents must pass: coherence, code_quality, pedagogy, depth, factuality.
+- Text documents must pass: coherence, pedagogy, linguistic, depth, factuality
+- Code documents must pass: coherence, code_quality, pedagogy, depth, factuality
+
+Retention rate: ~10-11%.
 
 ### Step 4 — Deduplication
 The filtered output was deduplicated using three methods:
-- **Exact dedup**: MD5 hash of full text
-- **URL dedup**: same URL → same content
-- **Fuzzy dedup**: MD5 hash of first 1000 normalized characters
+- **Exact**: MD5 hash of full text
+- **URL**: same URL = same content
+- **Fuzzy**: MD5 hash of first 1000 normalized characters (catches near-duplicates with different headers/footers)
 
-## Dataset fields
+## Fields
 
 | Field | Type | Description |
 |---|---|---|
@@ -117,7 +120,7 @@ The filtered output was deduplicated using three methods:
 | `score_depth` | float | Fasttext confidence for "high" depth |
 | `score_factuality` | float | Fasttext confidence for "high" factuality |
 
-> **Note**: The `score_*` fields are fasttext classifier confidences (0-1), not the original LLM scores (0-5).
+> The `score_*` fields are fasttext classifier confidences (0-1), not the original LLM scores (0-5). They are metadata and can be ignored for training.
 
 ## Usage
 
@@ -128,15 +131,12 @@ ds = load_dataset("{repo_id}")
 print(ds["train"][0]["text"][:500])
 ```
 
-## Source
+## Source & License
 
-- **Base dataset**: [HuggingFaceFW/fineweb-2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2) (`fra_Latn` partition)
+- **Base dataset**: [HuggingFaceFW/fineweb-2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2) (`fra_Latn`)
 - **Annotation model**: Qwen2.5-32B-Instruct-AWQ
 - **Built with**: [R-Velvet](https://github.com/thevesperhouse-hub/R-Velvet)
-
-## License
-
-This dataset inherits the [ODC-BY 1.0](https://opendatacommons.org/licenses/by/1-0/) license from FineWeb-2.
+- **License**: [ODC-BY 1.0](https://opendatacommons.org/licenses/by/1-0/) (inherited from FineWeb-2)
 """
 
 
