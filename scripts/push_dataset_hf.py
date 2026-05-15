@@ -149,6 +149,8 @@ def main():
 
     from huggingface_hub import HfApi
     import pyarrow.parquet as pq
+    from pathlib import Path
+    import shutil
 
     api = HfApi()
 
@@ -172,39 +174,38 @@ def main():
     )
     print(f"Repo created/exists: {args.repo}")
 
+    # Build a staging folder with the right structure
+    staging = Path(tempfile.mkdtemp(prefix="vesper_hf_"))
+    data_dir = staging / "data"
+    data_dir.mkdir()
+
     # Generate README
     readme_content = README_TEMPLATE.format(
         n_docs=f"**~{n_docs/1e6:.1f}M**",
         repo_id=args.repo,
     )
+    (staging / "README.md").write_text(readme_content, encoding="utf-8")
 
-    # Write README to temp file and upload
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False,
-                                      encoding="utf-8") as f:
-        f.write(readme_content)
-        readme_path = f.name
-
+    # Symlink or copy parquet into data/
+    parquet_dest = data_dir / "train-00000-of-00001.parquet"
+    src = Path(args.parquet).resolve()
     try:
-        print("Uploading README.md...")
-        api.upload_file(
-            path_or_fileobj=readme_path,
-            path_in_repo="README.md",
-            repo_id=args.repo,
-            repo_type="dataset",
-            commit_message="Add dataset card",
-        )
-    finally:
-        os.unlink(readme_path)
+        os.symlink(src, parquet_dest)
+    except OSError:
+        print("Symlink failed, copying parquet to staging dir...")
+        shutil.copy2(src, parquet_dest)
 
-    # Upload parquet
-    print(f"Uploading parquet ({size_mb:,.0f} MB)...")
-    api.upload_file(
-        path_or_fileobj=args.parquet,
-        path_in_repo="data/train-00000-of-00001.parquet",
+    print(f"Staging folder: {staging}")
+    print(f"Uploading with upload_large_folder (handles chunking + resume)...")
+
+    api.upload_large_folder(
+        folder_path=str(staging),
         repo_id=args.repo,
         repo_type="dataset",
-        commit_message=f"Add dataset ({n_docs:,} rows)",
     )
+
+    # Cleanup staging
+    shutil.rmtree(staging, ignore_errors=True)
 
     print(f"\nDone!")
     print(f"  https://huggingface.co/datasets/{args.repo}")
