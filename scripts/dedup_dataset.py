@@ -20,8 +20,11 @@ Usage:
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
+
+from tqdm import tqdm
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -68,18 +71,25 @@ def main():
 
     t0 = time.time()
 
+    # Count total lines for tqdm (fast: just count newlines via file size estimate)
+    file_size = os.path.getsize(args.input)
+
     with open(args.input, "r", encoding="utf-8", errors="replace") as f_in, \
          open(args.output, "w", encoding="utf-8") as f_out:
 
-        for line in f_in:
-            n_total += 1
+        pbar = tqdm(f_in, unit="docs", desc="Dedup",
+                    total=None)  # unknown total, shows rate + count
 
-            if n_total % 1_000_000 == 0:
-                elapsed = time.time() - t0
-                rate = n_total / elapsed
-                dup_pct = (1 - n_kept / max(n_total, 1)) * 100
-                print(f"  {n_total:>12,} read | {n_kept:>10,} kept | "
-                      f"dupes: {dup_pct:.2f}% | {rate:,.0f} lines/s")
+        for line in pbar:
+            n_total += 1
+            n_removed = n_exact + n_url + n_fuzzy
+            if n_total % 10_000 == 0:
+                dup_pct = n_removed / max(n_total, 1) * 100
+                pbar.set_postfix(
+                    kept=f"{n_kept:,}",
+                    dupes=f"{n_removed:,} ({dup_pct:.1f}%)",
+                    exact=n_exact, url=n_url, fuzzy=n_fuzzy
+                )
 
             line = line.strip()
             if not line:
@@ -121,6 +131,8 @@ def main():
 
             f_out.write(line + "\n")
             n_kept += 1
+
+        pbar.close()
 
     elapsed = time.time() - t0
     n_removed = n_total - n_kept - n_parse_err
