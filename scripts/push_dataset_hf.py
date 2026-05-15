@@ -2,7 +2,7 @@
 
 Usage:
     python scripts/push_dataset_hf.py \
-        --parquet data/vesper_edu_fr.parquet \
+        --parquet-dir data/vesper_edu_fr_parquet \
         --repo AkiraXan/Vesper-Edu-FR
 """
 
@@ -142,9 +142,14 @@ This dataset inherits the [ODC-BY 1.0](https://opendatacommons.org/licenses/by/1
 
 def main():
     parser = argparse.ArgumentParser(description="Push dataset to HuggingFace Hub")
-    parser.add_argument("--parquet", required=True, help="Parquet file to push")
-    parser.add_argument("--repo", required=True, help="HF repo (e.g. AkiraXan/Vesper-Edu-FR)")
-    parser.add_argument("--public", action="store_true", help="Make repo public (default: private)")
+    parser.add_argument("--parquet-dir", required=True,
+                        help="Directory containing parquet shards")
+    parser.add_argument("--repo", required=True,
+                        help="HF repo (e.g. AkiraXan/Vesper-Edu-FR)")
+    parser.add_argument("--public", action="store_true",
+                        help="Make repo public (default: private)")
+    parser.add_argument("--delete-old", action="store_true",
+                        help="Delete old single parquet file from repo first")
     args = parser.parse_args()
 
     from huggingface_hub import HfApi
@@ -154,14 +159,24 @@ def main():
 
     api = HfApi()
 
-    # Get row count
-    pf = pq.ParquetFile(args.parquet)
-    n_docs = pf.metadata.num_rows
-    size_mb = os.path.getsize(args.parquet) / 1e6
+    # Count rows across all shards
+    parquet_dir = Path(args.parquet_dir)
+    shards = sorted(parquet_dir.glob("*.parquet"))
+    if not shards:
+        print(f"No parquet files found in {parquet_dir}")
+        sys.exit(1)
 
-    print(f"Dataset: {args.parquet}")
-    print(f"  Rows: {n_docs:,}")
-    print(f"  Size: {size_mb:,.0f} MB")
+    n_docs = 0
+    total_size = 0
+    for shard in shards:
+        pf = pq.ParquetFile(shard)
+        n_docs += pf.metadata.num_rows
+        total_size += shard.stat().st_size
+
+    print(f"Dataset: {parquet_dir}")
+    print(f"  Shards: {len(shards)}")
+    print(f"  Total rows: {n_docs:,}")
+    print(f"  Total size: {total_size / 1e9:.1f} GB")
     print(f"  Repo: {args.repo}")
     print(f"  Private: {not args.public}")
 
@@ -174,7 +189,20 @@ def main():
     )
     print(f"Repo created/exists: {args.repo}")
 
-    # Build a staging folder with the right structure
+    # Delete old single parquet if requested
+    if args.delete_old:
+        try:
+            api.delete_file(
+                path_in_repo="data/train-00000-of-00001.parquet",
+                repo_id=args.repo,
+                repo_type="dataset",
+                commit_message="Remove old single parquet file",
+            )
+            print("Deleted old single parquet file")
+        except Exception:
+            print("No old single parquet to delete")
+
+    # Build staging folder
     staging = Path(tempfile.mkdtemp(prefix="vesper_hf_"))
     data_dir = staging / "data"
     data_dir.mkdir()
@@ -186,17 +214,19 @@ def main():
     )
     (staging / "README.md").write_text(readme_content, encoding="utf-8")
 
-    # Symlink or copy parquet into data/
-    parquet_dest = data_dir / "train-00000-of-00001.parquet"
-    src = Path(args.parquet).resolve()
-    try:
-        os.symlink(src, parquet_dest)
-    except OSError:
-        print("Symlink failed, copying parquet to staging dir...")
-        shutil.copy2(src, parquet_dest)
+    # Symlink shards into data/
+    for shard in shards:
+        dest = data_dir / shard.name
+        src = shard.resolve()
+        try:
+            os.symlink(src, dest)
+        except OSError:
+            print(f"Symlink failed for {shard.name}, copying...")
+            shutil.copy2(src, dest)
 
-    print(f"Staging folder: {staging}")
-    print(f"Uploading with upload_large_folder (handles chunking + resume)...")
+    print(f"\nStaging folder: {staging}")
+    print(f"  {len(shards)} shards in data/")
+    print(f"Uploading with upload_large_folder...")
 
     api.upload_large_folder(
         folder_path=str(staging),
