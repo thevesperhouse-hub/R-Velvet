@@ -56,13 +56,13 @@ class VelvetOptimizer(Optimizer):
         self._lvs_phase_steps = 20000
         self._lvs_confidence = 0.0
         self._entropy_scale = 1.0
-        self._lvs_momentum_up = 0.8
-        self._lvs_momentum_down = 0.995
+        self._lvs_momentum_up = 0.995
+        self._lvs_momentum_down = 0.9
         self._plateau_counter = 0
         self._plateau_threshold = 0.005
         self._plateau_patience = 200
         self._burst_duration = 50
-        self._burst_multiplier = 2.0
+        self._burst_multiplier = 1.3
         self._burst_step = -1
         self._perplexity_scale = 1.0
         self._last_grad_norm = 0.0
@@ -99,7 +99,11 @@ class VelvetOptimizer(Optimizer):
             pgm_scale = 0.8 + 0.5 * (ratio - 0.2)
         else:
             pgm_scale = 0.8 + 2.0 * (0.2 - ratio)
-        self._perplexity_scale = max(0.7, min(1.3, pgm_scale))
+        target = max(0.7, min(1.3, pgm_scale))
+        # Dampen PGM: max ±0.02 change per step to prevent momentum whiplash
+        delta = target - self._perplexity_scale
+        delta = max(-0.02, min(0.02, delta))
+        self._perplexity_scale += delta
 
         log_loss = math.log(max(loss_val, 1e-8))
         if self._ema_current is None:
