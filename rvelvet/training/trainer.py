@@ -237,11 +237,38 @@ class Trainer:
 
             self.scaler.unscale_(self.optimizer)
             if self.use_velvet:
-                self.optimizer.clip_grad_norm_()
+                grad_norm = self.optimizer.clip_grad_norm_()
             else:
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), tcfg.grad_clip,
-                )
+                ).item()
+
+            # Stability guard: skip step if loss or grads are bad
+            skip_step = False
+            if not math.isfinite(step_loss):
+                tqdm.write(f"[step {self.global_step+1}] WARNING: non-finite loss ({step_loss}), skipping step")
+                skip_step = True
+            elif grad_norm > 1e8:
+                tqdm.write(f"[step {self.global_step+1}] WARNING: grad_norm={grad_norm:.2e}, skipping step")
+                skip_step = True
+            elif hasattr(self, '_prev_loss') and self._prev_loss is not None:
+                if step_loss > self._prev_loss * 5 and self.global_step > 100:
+                    tqdm.write(f"[step {self.global_step+1}] WARNING: loss spike {self._prev_loss:.2f} -> {step_loss:.2f}, skipping step")
+                    skip_step = True
+
+            if skip_step:
+                self.optimizer.zero_grad()
+                self._skip_count = getattr(self, '_skip_count', 0) + 1
+                # If too many skips in a row, rollback to last checkpoint
+                if self._skip_count >= 10:
+                    tqdm.write(f"[step {self.global_step+1}] 10 consecutive skips — rolling back to last checkpoint")
+                    self._rollback_checkpoint()
+                    self._skip_count = 0
+                continue
+
+            self._skip_count = 0
+            self._prev_loss = step_loss
+
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad()
@@ -364,3 +391,30 @@ class Trainer:
         )
         for old in ckpts[:-keep_n]:
             old.unlink()
+
+    def _rollback_checkpoint(self):
+        """Load the most recent checkpoint after repeated unstable steps."""
+        ckpts = sorted(
+            self.output_dir.glob("ckpt_step*.pt"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not ckpts:
+            tqdm.write("  No checkpoint found for rollback, continuing anyway")
+            return
+
+        path = ckpts[-1]
+        tqdm.write(f"  Rolling back to {path.name}")
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        # Unwrap compiled model if needed
+        model = self.model
+        if hasattr(model, '_orig_mod'):
+            model = model._orig_mod
+        model.load_state_dict(ckpt['model'])
+
+        self.optimizer.load_state_dict(ckpt['optimizer'])
+        if self.scheduler and ckpt.get('scheduler'):
+            self.scheduler.load_state_dict(ckpt['scheduler'])
+        self.global_step = ckpt['step']
+        self._prev_loss = None
+        tqdm.write(f"  Rolled back to step {self.global_step}")
