@@ -8,7 +8,8 @@ stopping_strategy: all_exhausted
 eos_token_id: null
 
 sources:
-  - path: AkiraXan/Vesper-FR
+  - path: parquet
+    data_files: "data/vesper_edu_fr_parquet/*.parquet"
     split: train
     weight: 100
     text_field: text
