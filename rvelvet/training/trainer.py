@@ -389,8 +389,13 @@ class Trainer:
         else:
             path = self.output_dir / f"ckpt_step{self.global_step}.pt"
 
+        # Save model without _orig_mod. prefix from torch.compile
+        model_state = self.model.state_dict()
+        if any(k.startswith('_orig_mod.') for k in model_state):
+            model_state = {k.replace('_orig_mod.', '', 1): v for k, v in model_state.items()}
+
         torch.save({
-            'model': self.model.state_dict(),
+            'model': model_state,
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict() if self.scheduler else None,
             'step': self.global_step,

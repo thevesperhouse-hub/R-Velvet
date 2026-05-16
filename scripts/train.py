@@ -211,11 +211,18 @@ def main():
     if resume:
         print(f"\nLoading checkpoint: {resume}")
         resume_ckpt = torch.load(resume, map_location='cpu', weights_only=False)
-        missing, unexpected = model.load_state_dict(resume_ckpt['model'], strict=False)
+        # Strip _orig_mod. prefix from torch.compile'd checkpoints
+        state = resume_ckpt['model']
+        if any(k.startswith('_orig_mod.') for k in state):
+            state = {k.replace('_orig_mod.', '', 1): v for k, v in state.items()}
+            print("  Stripped _orig_mod. prefix (torch.compile checkpoint)")
+        missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:
             print(f"  Missing keys (new modules): {len(missing)}")
         if unexpected:
             print(f"  Unexpected keys: {len(unexpected)}")
+        if not missing and not unexpected:
+            print(f"  All keys matched")
         print(f"  Resuming from step {resume_ckpt.get('step', '?')}")
 
     if cfg.training.debug:
