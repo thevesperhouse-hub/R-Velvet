@@ -47,6 +47,15 @@ class Trainer:
         self.output_dir = Path(cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def resume_from_checkpoint(self, ckpt: dict):
+        """Restore optimizer, scheduler, and global_step from a checkpoint dict."""
+        if 'optimizer' in ckpt:
+            self.optimizer.load_state_dict(ckpt['optimizer'])
+            print(f"  Restored optimizer state")
+        if 'step' in ckpt:
+            self.global_step = ckpt['step']
+            print(f"  Restored global_step = {self.global_step}")
+
     def _resolve_amp_dtype(self):
         amp_setting = getattr(self.tcfg, 'amp', 'bf16')
         if amp_setting == 'bf16' and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
@@ -141,15 +150,23 @@ class Trainer:
 
         self.scheduler = self._build_scheduler(max_steps)
 
+        # If resuming, fast-forward scheduler to current step
+        if self.global_step > 0:
+            for _ in range(self.global_step):
+                self.scheduler.step()
+            print(f"  Scheduler fast-forwarded to step {self.global_step}")
+
         if self.use_velvet:
             self.optimizer.set_training_steps(max_steps)
         csv_path = self.output_dir / "metrics.csv"
-        csv_file = open(csv_path, 'w', newline='')
+        resuming = self.global_step > 0
+        csv_file = open(csv_path, 'a' if resuming else 'w', newline='')
         csv_writer = csv.writer(csv_file)
         csv_headers = ['step', 'loss', 'ce', 'ppl', 'lr', 'elapsed']
         if self.use_velvet:
             csv_headers += ['beta1', 'lvs_scale', 'signal', 'pgm_scale', 'grad_norm', 'lvs_phase']
-        csv_writer.writerow(csv_headers)
+        if not resuming:
+            csv_writer.writerow(csv_headers)
 
         is_iterable = isinstance(self.train_dataset, torch.utils.data.IterableDataset)
         loader = DataLoader(

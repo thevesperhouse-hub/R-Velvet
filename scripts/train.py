@@ -207,14 +207,16 @@ def main():
         print(f"  {name:25s}: {count:>10,}")
 
     resume = cfg.training.get('resume_from', None)
+    resume_ckpt = None
     if resume:
         print(f"\nLoading checkpoint: {resume}")
-        ckpt = torch.load(resume, map_location='cpu', weights_only=True)
-        missing, unexpected = model.load_state_dict(ckpt['model'], strict=False)
+        resume_ckpt = torch.load(resume, map_location='cpu', weights_only=False)
+        missing, unexpected = model.load_state_dict(resume_ckpt['model'], strict=False)
         if missing:
             print(f"  Missing keys (new modules): {len(missing)}")
         if unexpected:
             print(f"  Unexpected keys: {len(unexpected)}")
+        print(f"  Resuming from step {resume_ckpt.get('step', '?')}")
 
     if cfg.training.debug:
         debug_path = Path("data/_debug.bin")
@@ -245,6 +247,10 @@ def main():
         print(f"\nDataset: {cfg.data.train_path} ({len(dataset)} samples)")
 
     trainer = Trainer(model, dataset, cfg)
+
+    if resume_ckpt:
+        trainer.resume_from_checkpoint(resume_ckpt)
+
     trainer.train()
 
 
