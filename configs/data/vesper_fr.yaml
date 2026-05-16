@@ -1,17 +1,13 @@
 seq_len: 2048
 stride: null
 tokenizer: data/velvet_tok_100k_unigram
-num_workers: 0
+num_workers: 4
 shuffle_buffer: 10000
 max_doc_tokens: 65536
 stopping_strategy: all_exhausted
 eos_token_id: null
 
-sources:
-  - path: parquet
-    data_files: "data/vesper_edu_fr_parquet/*.parquet"
-    split: train
-    weight: 100
-    text_field: text
+# Pre-tokenized binary (fast, mmap, zero overhead)
+train_path: data/train.bin
 
 val_path: data/val.bin
