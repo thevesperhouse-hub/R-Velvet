@@ -124,8 +124,8 @@ class VelvetOptimizer(Optimizer):
         gap = max(-1.0, min(1.0, gap))
         self._lvs_confidence = min(1.0, abs(gap) * 10.0)
         phase = min(1.0, self._global_step / max(self._lvs_phase_steps, 1))
-        max_boost = 1.3 - 0.2 * phase
-        max_damp = 0.7 + 0.2 * phase
+        max_boost = 1.1 - 0.05 * phase   # 1.1 early → 1.05 late
+        max_damp = 0.9 + 0.05 * phase   # 0.9 early → 0.95 late
         if gap < -0.005:
             raw_scale = max_boost
         elif gap > 0.005:
