@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from pathlib import Path
+from tqdm import tqdm
 
 from .losses import compute_phase_loss
 from .velvet_optimizer import VelvetOptimizer
@@ -192,9 +193,16 @@ class Trainer:
                   f"anchor={self.optimizer._anchor_window_min}→{self.optimizer._anchor_window_max}")
         else:
             print()
-        print(f"Effective batch: {tcfg.batch_size * accum_steps}")
-        print(f"Max steps: {max_steps}")
+        eff_batch = tcfg.batch_size * accum_steps
+        seq_len = self.cfg.data.seq_len
+        tokens_per_step = eff_batch * seq_len
+        print(f"Effective batch: {eff_batch}")
+        print(f"Tokens/step: {tokens_per_step:,}")
+        print(f"Max steps: {max_steps} (~{max_steps * tokens_per_step / 1e9:.1f}B tokens)")
         print("-" * 60)
+
+        pbar = tqdm(total=max_steps, unit="step", desc="Training",
+                    initial=self.global_step)
 
         while self.global_step < max_steps:
             step_loss = 0.0
@@ -243,6 +251,18 @@ class Trainer:
                 self.optimizer.set_loss_metrics(step_loss, self.cfg.model.vocab_size)
 
             self.global_step += 1
+            pbar.update(1)
+
+            # Update tqdm postfix every step
+            if self.use_velvet:
+                lr_now = self.optimizer.effective_lr
+            else:
+                lr_now = self.optimizer.param_groups[0]['lr']
+            pbar.set_postfix(
+                loss=f"{step_loss:.3f}",
+                ppl=f"{math.exp(min(step_loss, 20)):.0f}",
+                lr=f"{lr_now:.1e}",
+            )
 
             if self.global_step % log_every == 0:
                 dt = time.time() - t0
@@ -251,21 +271,15 @@ class Trainer:
                 avg_loss = accum_loss / n
                 avg_dict = {k: v / n for k, v in loss_dict_accum.items()}
 
-                if self.use_velvet:
-                    lr_now = self.optimizer.effective_lr
-                else:
-                    lr_now = self.optimizer.param_groups[0]['lr']
-
                 ce_val = avg_dict.get('ce', 0)
                 ppl_val = math.exp(min(ce_val, 20))
+                tok_per_sec = n * tokens_per_step / max(dt, 0.01)
 
                 log_parts = [
-                    f"step {self.global_step}/{max_steps}",
                     f"loss={avg_loss:.4f}",
-                    f"ce={ce_val:.4f}",
                     f"ppl={ppl_val:.1f}",
                     f"lr={lr_now:.2e}",
-                    f"{dt:.1f}s",
+                    f"{tok_per_sec/1000:.0f}k tok/s",
                 ]
                 if 'load_balance' in avg_dict:
                     log_parts.append(f"lb={avg_dict['load_balance']:.4f}")
@@ -276,11 +290,10 @@ class Trainer:
                 if self.use_velvet:
                     log_parts.append(f"b1={self.optimizer.effective_beta1:.3f}")
                     log_parts.append(f"lvs={self.optimizer.lr_scale:.3f}")
-                    log_parts.append(f"sig={self.optimizer.lvs_confidence:.2f}")
                     if self.optimizer.is_bursting:
                         log_parts.append("BURST")
 
-                print(" | ".join(log_parts))
+                tqdm.write(f"[step {self.global_step}] " + " | ".join(log_parts))
 
                 csv_row = [self.global_step, f"{avg_loss:.6f}", f"{ce_val:.6f}",
                            f"{ppl_val:.2f}", f"{lr_now:.6e}", f"{dt:.2f}"]
@@ -299,7 +312,8 @@ class Trainer:
                 if tcfg.wandb and not tcfg.debug:
                     try:
                         import wandb
-                        log_dict = {**avg_dict, 'lr': lr_now, 'step': self.global_step}
+                        log_dict = {**avg_dict, 'lr': lr_now, 'step': self.global_step,
+                                    'tokens_per_sec': tok_per_sec}
                         if self.use_velvet:
                             log_dict['effective_beta1'] = self.optimizer.effective_beta1
                             log_dict['lvs_scale'] = self.optimizer.lr_scale
@@ -316,11 +330,13 @@ class Trainer:
             if not tcfg.debug and self.global_step % tcfg.save_every == 0:
                 self._save_checkpoint()
 
+        pbar.close()
+
         if not tcfg.debug:
             self._save_checkpoint(tag='final')
 
         csv_file.close()
-        print(f"\nTraining complete: {self.global_step} steps")
+        print(f"\nTraining complete: {self.global_step} steps ({self.global_step * tokens_per_step / 1e9:.1f}B tokens)")
         print(f"Metrics saved: {csv_path}")
 
     def _save_checkpoint(self, tag=None):
