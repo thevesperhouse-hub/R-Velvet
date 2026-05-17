@@ -118,6 +118,7 @@ class Trainer:
                 weight_decay=tcfg.weight_decay,
                 max_grad_norm=tcfg.grad_clip,
                 entropy_adaptive=getattr(tcfg, 'velvet_lvs', False),
+                perplexity_guided=getattr(tcfg, 'velvet_pgm', False),
                 sparse_aware=True,
             )
         else:
