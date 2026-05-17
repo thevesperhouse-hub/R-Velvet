@@ -47,6 +47,7 @@ class MemoryController(nn.Module):
             nn.Linear(d_model, 1, bias=False),
             nn.Sigmoid(),
         )
+        self.write_norm = RMSNorm(d_model)
 
         self.register_buffer(
             'staleness', torch.zeros(memory_size), persistent=False
@@ -55,6 +56,7 @@ class MemoryController(nn.Module):
         self.n_read_steps = n_read_steps
         if n_read_steps > 1:
             self.hop_transform = nn.Linear(d_model * 2, d_model, bias=False)
+            self.hop_norm = RMSNorm(d_model)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -95,7 +97,7 @@ class MemoryController(nn.Module):
                 retrieved = read_out
             else:
                 combined = torch.cat([retrieved, read_out], dim=-1)
-                retrieved = self.hop_transform(combined)
+                retrieved = self.hop_norm(self.hop_transform(combined))
 
             if step < self.n_read_steps - 1:
                 current_query = query + retrieved
@@ -126,7 +128,7 @@ class MemoryController(nn.Module):
 
         updated_memory = (1 - gate) * memory + gate * write_content
 
-        return updated_memory
+        return self.write_norm(updated_memory)
 
     def write_with_priority(
         self,
@@ -156,7 +158,7 @@ class MemoryController(nn.Module):
 
         updated_memory = (1 - gate) * memory + gate * write_content
 
-        return updated_memory
+        return self.write_norm(updated_memory)
 
     def forward(
         self,

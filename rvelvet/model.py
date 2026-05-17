@@ -141,9 +141,16 @@ class RVelvet(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        n_residual = 2 * (self.n_local_layers + self.n_global_layers) + 2
+        residual_scale = 1.0 / math.sqrt(n_residual)
+
         for name, p in self.named_parameters():
             if 'weight' in name and p.dim() >= 2:
-                nn.init.xavier_normal_(p, gain=0.5)
+                if 'out_proj' in name or name.endswith('w2.weight'):
+                    # Scale output projections in residual blocks
+                    nn.init.xavier_normal_(p, gain=residual_scale)
+                else:
+                    nn.init.xavier_normal_(p, gain=0.5)
             elif 'bias' in name:
                 nn.init.zeros_(p)
 
@@ -541,6 +548,7 @@ class ExpansionLayer(nn.Module):
 
         self.norm_q = RMSNorm(d_model)
         self.norm_kv = RMSNorm(d_model)
+        self.post_norm = RMSNorm(d_model)
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
@@ -571,7 +579,7 @@ class ExpansionLayer(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         out = self.out_proj(out)
 
-        return tokens + out
+        return self.post_norm(tokens + out)
 
 
 class RMSNorm(nn.Module):
