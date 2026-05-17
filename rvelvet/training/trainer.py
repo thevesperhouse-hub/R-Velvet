@@ -117,7 +117,7 @@ class Trainer:
                 eps=getattr(tcfg, 'eps', 1e-8),
                 weight_decay=tcfg.weight_decay,
                 max_grad_norm=tcfg.grad_clip,
-                entropy_adaptive=True,
+                entropy_adaptive=getattr(tcfg, 'velvet_lvs', False),
                 sparse_aware=True,
             )
         else:
