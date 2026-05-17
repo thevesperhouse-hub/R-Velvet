@@ -89,7 +89,7 @@ def generate(model, input_ids, max_new_tokens=100, temperature=0.8,
 
     for _ in range(max_new_tokens):
         # Truncate to max_seq_len if needed
-        context = generated[:, -model.max_seq_len:]
+        context = generated[:, -model.pos_embed.num_embeddings:]
 
         output = model(context, causal=True)
         logits = output['logits'][:, -1, :]  # (batch, vocab)
