@@ -36,6 +36,7 @@ class VelvetOptimizer(Optimizer):
         entropy_adaptive: bool = True,
         perplexity_guided: bool = True,
         sparse_aware: bool = True,
+        **kwargs,
     ):
         defaults = dict(
             lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
@@ -67,7 +68,10 @@ class VelvetOptimizer(Optimizer):
         self._perplexity_scale = 1.0
         self._last_grad_norm = 0.0
         self._global_step = 0
-        if HAS_TRITON and torch.cuda.is_available():
+        force_backend = kwargs.pop("force_backend", None)
+        if force_backend:
+            self._kernel_backend = force_backend
+        elif HAS_TRITON and torch.cuda.is_available():
             self._kernel_backend = "triton"
         elif HAS_CUDA_EXT and torch.cuda.is_available():
             self._kernel_backend = "cuda"

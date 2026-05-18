@@ -119,7 +119,8 @@ class Trainer:
                 max_grad_norm=tcfg.grad_clip,
                 entropy_adaptive=getattr(tcfg, 'velvet_lvs', False),
                 perplexity_guided=getattr(tcfg, 'velvet_pgm', False),
-                sparse_aware=True,
+                sparse_aware=getattr(tcfg, 'velvet_sparse', False),
+                force_backend=getattr(tcfg, 'velvet_backend', None),
             )
         else:
             optimizer = torch.optim.AdamW(
