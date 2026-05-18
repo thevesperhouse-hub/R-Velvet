@@ -19,8 +19,9 @@ def compute_phase_loss(
     """Compute total loss and components for the given phase."""
     logits = model_output['logits']
     B, L, V = logits.shape
+    # Upcast to fp32 before cross_entropy — bf16 logits over 100k vocab lose precision
     ce_loss = F.cross_entropy(
-        logits.reshape(B * L, V),
+        logits.float().reshape(B * L, V),
         targets.reshape(B * L),
         ignore_index=-1,
     )
