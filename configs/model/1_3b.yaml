@@ -8,7 +8,7 @@ n_local_heads: 14
 n_global_heads: 14
 window_size: 512
 segment_size: 512
-n_concepts: 1
+n_concepts: 4
 n_refine_layers: 2
 memory_size: 256
 n_read_steps: 2

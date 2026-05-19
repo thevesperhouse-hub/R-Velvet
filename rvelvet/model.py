@@ -190,14 +190,9 @@ class RVelvet(nn.Module):
             refined_concepts = global_out['concepts']
             relevance = global_out['relevance']
 
-            if memory is not None:
-                mem_out = self.memory_controller(refined_concepts, memory)
-                enriched_concepts = mem_out['enriched']
-                updated_memory = mem_out['memory']
-            else:
-                # Skip memory controller when no memory provided (phase1)
-                enriched_concepts = refined_concepts
-                updated_memory = None
+            mem_out = self.memory_controller(refined_concepts, memory)
+            enriched_concepts = mem_out['enriched']
+            updated_memory = mem_out['memory']
 
         expanded = self.expansion(local_out, enriched_concepts)
 
