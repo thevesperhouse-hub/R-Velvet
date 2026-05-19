@@ -45,6 +45,8 @@ class SegmentCompressor(nn.Module):
             torch.randn(1, segment_size, d_model) * 0.02
         )
 
+        self.out_norm = RMSNorm(d_model)
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -77,6 +79,8 @@ class SegmentCompressor(nn.Module):
             )
             if return_weights:
                 all_weights.append(w)
+
+        concepts = self.out_norm(concepts)
 
         if return_weights:
             return concepts, all_weights

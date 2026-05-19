@@ -48,6 +48,7 @@ class MemoryController(nn.Module):
             nn.Sigmoid(),
         )
         self.write_norm = RMSNorm(d_model)
+        self.enriched_norm = RMSNorm(d_model)
 
         self.register_buffer(
             'staleness', torch.zeros(memory_size), persistent=False
@@ -173,7 +174,7 @@ class MemoryController(nn.Module):
             memory = self.init_memory(B, device)
 
         retrieved = self.read(concepts, memory)
-        enriched = concepts + retrieved
+        enriched = self.enriched_norm(concepts + retrieved)
 
         if write_priority is not None:
             updated_memory = self.write_with_priority(enriched, memory, write_priority)

@@ -548,7 +548,6 @@ class ExpansionLayer(nn.Module):
 
         self.norm_q = RMSNorm(d_model)
         self.norm_kv = RMSNorm(d_model)
-        self.post_norm = RMSNorm(d_model)
 
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
@@ -579,7 +578,7 @@ class ExpansionLayer(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         out = self.out_proj(out)
 
-        return self.post_norm(tokens + out)
+        return tokens + out
 
 
 class RMSNorm(nn.Module):
