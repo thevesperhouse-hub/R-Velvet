@@ -554,6 +554,10 @@ class ExpansionLayer(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
+        # Learnable gate — starts near-zero so concept path activates gradually
+        # (Flamingo-style gated cross-attention for multi-stream stability)
+        self.cross_gate = nn.Parameter(torch.full((1,), -4.0))
+
         self.dropout = nn.Dropout(dropout)
 
     def forward(
@@ -578,7 +582,8 @@ class ExpansionLayer(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         out = self.out_proj(out)
 
-        return tokens + out
+        gate = torch.sigmoid(self.cross_gate)
+        return tokens + gate * out
 
 
 class RMSNorm(nn.Module):

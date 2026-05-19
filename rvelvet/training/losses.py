@@ -19,14 +19,18 @@ def compute_phase_loss(
     """Compute total loss and components for the given phase."""
     logits = model_output['logits']
     B, L, V = logits.shape
+    logits_f = logits.float()
     # Upcast to fp32 before cross_entropy — bf16 logits over 100k vocab lose precision
     ce_loss = F.cross_entropy(
-        logits.float().reshape(B * L, V),
+        logits_f.reshape(B * L, V),
         targets.reshape(B * L),
         ignore_index=-1,
     )
-    loss_dict = {'ce': ce_loss}
-    total_loss = ce_loss
+    # z-loss: penalise logit growth — prevents embedding explosion with
+    # 100k vocab + tied weights (PaLM technique)
+    z_loss = 1e-4 * torch.logsumexp(logits_f, dim=-1).pow(2).mean()
+    loss_dict = {'ce': ce_loss, 'z_loss': z_loss}
+    total_loss = ce_loss + z_loss
 
     if phase == 'phase2_acr':
         acr_losses = compute_acr_losses(

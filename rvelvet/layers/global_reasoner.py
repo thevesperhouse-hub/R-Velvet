@@ -95,6 +95,9 @@ class GlobalSelfAttention(nn.Module):
         q, k, v = qkv.unbind(0)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        # Soft-cap logits: prevents degenerate one-hot attention in deep
+        # layers on short concept sequences (14 heads / 16 concepts = ~1 pos/head)
+        attn = 50.0 * torch.tanh(attn / 50.0)
 
         if causal:
             mask = torch.triu(

@@ -333,6 +333,14 @@ class Trainer:
                     log_parts.append(f"halt={avg_dict['halting']:.4f}")
                 if 'deep_supervision' in avg_dict:
                     log_parts.append(f"deep={avg_dict['deep_supervision']:.4f}")
+                if 'z_loss' in avg_dict:
+                    log_parts.append(f"z={avg_dict['z_loss']:.4f}")
+                # Log expansion gate value
+                gate_val = None
+                _m = self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
+                if hasattr(_m, 'expansion') and hasattr(_m.expansion, 'cross_gate'):
+                    gate_val = torch.sigmoid(_m.expansion.cross_gate).item()
+                    log_parts.append(f"gate={gate_val:.3f}")
                 if self.use_velvet:
                     log_parts.append(f"b1={self.optimizer.effective_beta1:.3f}")
                     log_parts.append(f"lvs={self.optimizer.lr_scale:.3f}")
@@ -365,6 +373,8 @@ class Trainer:
                             log_dict['lvs_scale'] = self.optimizer.lr_scale
                             log_dict['lvs_confidence'] = self.optimizer.lvs_confidence
                             log_dict['grad_norm'] = self.optimizer.last_grad_norm
+                        if gate_val is not None:
+                            log_dict['expansion_gate'] = gate_val
                         wandb.log(log_dict)
                     except Exception:
                         pass
