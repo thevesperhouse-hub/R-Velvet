@@ -267,11 +267,11 @@ class Trainer:
             if not math.isfinite(step_loss):
                 tqdm.write(f"[step {self.global_step+1}] WARNING: non-finite loss ({step_loss}), skipping step")
                 skip_step = True
-            elif grad_norm > 1e8:
+            elif grad_norm > 100:
                 tqdm.write(f"[step {self.global_step+1}] WARNING: grad_norm={grad_norm:.2e}, skipping step")
                 skip_step = True
             elif hasattr(self, '_prev_loss') and self._prev_loss is not None:
-                if step_loss > self._prev_loss * 5 and self.global_step > 100:
+                if step_loss > self._prev_loss * 1.5 and self.global_step > 100:
                     tqdm.write(f"[step {self.global_step+1}] WARNING: loss spike {self._prev_loss:.2f} -> {step_loss:.2f}, skipping step")
                     skip_step = True
 
