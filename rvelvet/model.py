@@ -174,7 +174,12 @@ class RVelvet(nn.Module):
 
         local_out = self.local_encoder(x, causal=causal)
 
-        concepts = self.compressor(local_out)
+        # Stop gradient from concept path → local encoder. The concept path
+        # (compressor → 13 global layers → memory) amplifies gradients
+        # unpredictably. Without detach, those amplified gradients contaminate
+        # the local encoder's clean 6-layer gradient, causing divergence at CE~3.5.
+        # The concept path still learns via expansion backward (scaled by gate).
+        concepts = self.compressor(local_out.detach())
         B_c, n_seg, K, D = concepts.shape
         concepts_flat = concepts.view(B, n_seg * K, D)
 
