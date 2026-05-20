@@ -30,6 +30,7 @@ from pathlib import Path
 from copy import deepcopy
 
 from rvelvet.model import RVelvet
+from rvelvet.model_vlm import VelvetLM
 from rvelvet.data.text_dataset import TextDataset
 from rvelvet.data.streaming_dataset import StreamingTextDataset
 from rvelvet.training.trainer import Trainer
@@ -131,34 +132,49 @@ def apply_overrides(cfg: Config, overrides: list):
         obj[final_key] = val
 
 
-def build_model(cfg: Config) -> RVelvet:
-    """Build RVelvet model from config."""
+def build_model(cfg: Config):
+    """Build model from config. Supports 'vlm' (VelvetLM) and 'rvelvet' architectures."""
     mcfg = cfg.model
-    tcfg = cfg.training
+    arch = getattr(mcfg, 'arch', 'rvelvet')
 
-    model = RVelvet(
-        vocab_size=mcfg.vocab_size,
-        d_model=mcfg.d_model,
-        n_local_layers=mcfg.n_local_layers,
-        n_global_layers=mcfg.n_global_layers,
-        n_local_heads=mcfg.n_local_heads,
-        n_global_heads=mcfg.n_global_heads,
-        window_size=mcfg.window_size,
-        segment_size=mcfg.segment_size,
-        n_concepts=mcfg.n_concepts,
-        n_refine_layers=mcfg.n_refine_layers,
-        memory_size=mcfg.memory_size,
-        n_read_steps=mcfg.n_read_steps,
-        ffn_mult=mcfg.ffn_mult,
-        dropout=mcfg.dropout,
-        max_seq_len=mcfg.max_seq_len,
-        use_acr=tcfg.use_acr,
-        use_iterative_reasoning=tcfg.use_iterative_reasoning,
-        max_reasoning_iterations=mcfg.max_reasoning_iterations,
-        lora_rank=mcfg.lora_rank,
-        halt_threshold=mcfg.halt_threshold,
-        lambda_p=mcfg.lambda_p,
-    )
+    if arch == 'vlm':
+        model = VelvetLM(
+            vocab_size=mcfg.vocab_size,
+            d_model=mcfg.d_model,
+            n_layers=mcfg.n_layers,
+            n_heads=mcfg.n_heads,
+            ffn_mult=mcfg.ffn_mult,
+            max_seq_len=mcfg.max_seq_len,
+            dropout=mcfg.dropout,
+            rope_theta=getattr(mcfg, 'rope_theta', 10000.0),
+            window_size=getattr(mcfg, 'window_size', 1024),
+            global_every=getattr(mcfg, 'global_every', 6),
+        )
+    else:
+        tcfg = cfg.training
+        model = RVelvet(
+            vocab_size=mcfg.vocab_size,
+            d_model=mcfg.d_model,
+            n_local_layers=mcfg.n_local_layers,
+            n_global_layers=mcfg.n_global_layers,
+            n_local_heads=mcfg.n_local_heads,
+            n_global_heads=mcfg.n_global_heads,
+            window_size=mcfg.window_size,
+            segment_size=mcfg.segment_size,
+            n_concepts=mcfg.n_concepts,
+            n_refine_layers=mcfg.n_refine_layers,
+            memory_size=mcfg.memory_size,
+            n_read_steps=mcfg.n_read_steps,
+            ffn_mult=mcfg.ffn_mult,
+            dropout=mcfg.dropout,
+            max_seq_len=mcfg.max_seq_len,
+            use_acr=tcfg.use_acr,
+            use_iterative_reasoning=tcfg.use_iterative_reasoning,
+            max_reasoning_iterations=mcfg.max_reasoning_iterations,
+            lora_rank=mcfg.lora_rank,
+            halt_threshold=mcfg.halt_threshold,
+            lambda_p=mcfg.lambda_p,
+        )
     return model
 
 
@@ -167,8 +183,8 @@ def main():
     parser.add_argument("--phase", type=str, required=True,
                         choices=["phase1_pretrain", "phase2_acr", "phase3_iterative"],
                         help="Training phase")
-    parser.add_argument("--model", type=str, default="base", choices=["small", "base", "1_3b"],
-                        help="Model config name")
+    parser.add_argument("--model", type=str, default="base",
+                        help="Model config name (e.g. 1_3b, 1_3b_vlm)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Checkpoint path to resume from")
     parser.add_argument("--data", type=str, default="text",

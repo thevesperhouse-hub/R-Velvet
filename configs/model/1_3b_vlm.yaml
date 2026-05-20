@@ -1,0 +1,13 @@
+# VelvetLM 1.3B — Gemma 3 / LLaMA 3 style
+name: 1_3b_vlm
+arch: vlm
+vocab_size: 100000
+d_model: 2048
+n_layers: 22
+n_heads: 16
+ffn_mult: 2.6875       # d_ff = 5504 (SwiGLU 2/3 × 4 × d)
+dropout: 0.0
+max_seq_len: 2048
+rope_theta: 10000.0
+window_size: 1024       # sliding window for local layers (inference)
+global_every: 6         # 1 global layer every 6 (Gemma 3 5:1 ratio)
