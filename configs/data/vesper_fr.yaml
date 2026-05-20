@@ -1,13 +1,15 @@
 seq_len: 2048
-stride: null
 tokenizer: data/velvet_tok_100k_unigram
-num_workers: 4
+num_workers: 0
 shuffle_buffer: 10000
 max_doc_tokens: 65536
 stopping_strategy: all_exhausted
 eos_token_id: null
 
-# Pre-tokenized binary (fast, mmap, zero overhead)
-train_path: data/train.bin
+sources:
+  - path: AkiraXan/Vesper-FR
+    split: train
+    weight: 100
+    text_field: text
 
 val_path: data/val.bin
